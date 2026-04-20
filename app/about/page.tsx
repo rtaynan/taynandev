@@ -54,6 +54,16 @@ export default function AboutPage() {
           else is ignoring.
         </p>
 
+        <h2>Consulting</h2>
+        <p>
+          Alongside my full-time work I occasionally take on select consulting
+          engagements — typically for teams navigating complex backend
+          challenges: distributed systems design, cloud cost optimization,
+          platform migrations, or architecture reviews. If you have something
+          interesting, the{" "}
+          <Link href="/contact">contact page</Link> is the right place to start.
+        </p>
+
         <h2>Elsewhere</h2>
         <p>
           You can find me on{" "}

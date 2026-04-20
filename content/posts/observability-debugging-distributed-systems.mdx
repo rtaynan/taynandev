@@ -1,0 +1,287 @@
+---
+title: "You Can't Debug What You Can't See: Observability in Production Distributed Systems"
+description: "Logs alone won't save you at 3am. Here's the observability setup I use to make distributed systems debuggable by design — structured logs, distributed traces, and alerts that actually mean something."
+date: "2026-04-20"
+tags: ["observability", "distributed-systems", "golang", "opentelemetry", "platform-engineering"]
+featured: false
+---
+
+Most production incidents I've dealt with follow the same pattern. Something is wrong. The metrics dashboard is red. And the logs — hundreds of lines per second across a dozen services — tell you everything except what you actually need to know.
+
+The problem isn't the lack of data. It's that the data wasn't designed to be useful when things break.
+
+Observability isn't about generating more telemetry. It's about instrumenting systems so that when something fails at 3am, you can answer three questions quickly: *what* is broken, *where* it broke, and *why*. If your current setup can't answer those three questions from the data at hand, you're flying blind.
+
+## The Three Pillars — and Why Most Teams Get Them Wrong
+
+**Logs, metrics, and traces** are the foundation, but each is commonly misused:
+
+- **Logs** get used as the primary debugging tool, leading teams to log everything and find nothing. Unstructured, context-free logs are noise.
+- **Metrics** get added reactively — after an incident — and end up measuring the wrong things. Most teams have plenty of infrastructure metrics (CPU, memory, request count) but are blind to *business-level* signals (processing lag, retry rate, queue depth by tenant).
+- **Traces** are frequently skipped entirely, or added as an afterthought. This is the biggest gap. Traces are the only tool that lets you follow a request across service boundaries. Without them, a cross-service latency issue is nearly impossible to diagnose.
+
+## Start With Structured Logs and Propagated Context
+
+The shift from `fmt.Printf("error: %v", err)` to structured logging with a consistent context model is the single highest-ROI change I've made to production systems.
+
+Every log entry should carry the same set of fields so you can filter meaningfully:
+
+```go
+package logger
+
+import (
+    "context"
+    "log/slog"
+    "os"
+)
+
+type contextKey string
+
+const (
+    traceIDKey    contextKey = "trace_id"
+    requestIDKey  contextKey = "request_id"
+    tenantIDKey   contextKey = "tenant_id"
+)
+
+func WithContext(ctx context.Context) *slog.Logger {
+    logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+    if traceID, ok := ctx.Value(traceIDKey).(string); ok {
+        logger = logger.With("trace_id", traceID)
+    }
+    if requestID, ok := ctx.Value(requestIDKey).(string); ok {
+        logger = logger.With("request_id", requestID)
+    }
+    if tenantID, ok := ctx.Value(tenantIDKey).(string); ok {
+        logger = logger.With("tenant_id", tenantID)
+    }
+
+    return logger
+}
+```
+
+Usage in a handler:
+
+```go
+func (h *OrderHandler) Process(ctx context.Context, order Order) error {
+    log := logger.WithContext(ctx)
+
+    log.Info("processing order",
+        "order_id", order.ID,
+        "amount", order.Amount,
+        "items", len(order.Items),
+    )
+
+    if err := h.validate(order); err != nil {
+        log.Error("order validation failed",
+            "order_id", order.ID,
+            "error", err,
+            "validation_rule", err.Rule,
+        )
+        return err
+    }
+
+    // ...
+}
+```
+
+The `trace_id` and `request_id` fields are what makes this useful. When an incident happens, you grab the trace ID from the alert, filter logs by that trace ID, and you have the full story for that specific request across every service that touched it — without grep-ing through millions of lines.
+
+## Distributed Tracing with OpenTelemetry
+
+If structured logs are the individual frames, distributed tracing is the film. OTel is now the standard — use it:
+
+```go
+package tracing
+
+import (
+    "context"
+
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/attribute"
+    "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+    "go.opentelemetry.io/otel/sdk/resource"
+    sdktrace "go.opentelemetry.io/otel/sdk/trace"
+    semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+)
+
+func NewTracerProvider(ctx context.Context, serviceName, serviceVersion string) (*sdktrace.TracerProvider, error) {
+    exporter, err := otlptracegrpc.New(ctx)
+    if err != nil {
+        return nil, err
+    }
+
+    tp := sdktrace.NewTracerProvider(
+        sdktrace.WithBatcher(exporter),
+        sdktrace.WithResource(resource.NewWithAttributes(
+            semconv.SchemaURL,
+            semconv.ServiceName(serviceName),
+            semconv.ServiceVersion(serviceVersion),
+        )),
+        sdktrace.WithSampler(sdktrace.TraceIDRatioBased(0.1)), // 10% sampling in prod
+    )
+
+    otel.SetTracerProvider(tp)
+    return tp, nil
+}
+```
+
+Instrumenting a business operation:
+
+```go
+var tracer = otel.Tracer("order-service")
+
+func (s *OrderService) Submit(ctx context.Context, order Order) error {
+    ctx, span := tracer.Start(ctx, "order.submit")
+    defer span.End()
+
+    span.SetAttributes(
+        attribute.String("order.id", order.ID),
+        attribute.Float64("order.amount", order.Amount),
+        attribute.String("order.tenant_id", order.TenantID),
+    )
+
+    if err := s.repo.Save(ctx, order); err != nil {
+        span.RecordError(err)
+        span.SetStatus(codes.Error, err.Error())
+        return fmt.Errorf("save order: %w", err)
+    }
+
+    span.AddEvent("order saved", trace.WithAttributes(
+        attribute.String("storage", "dynamodb"),
+    ))
+
+    return s.publisher.Publish(ctx, OrderSubmittedEvent{OrderID: order.ID})
+}
+```
+
+**What this gives you:** when `order.submit` is slow, you open the trace and immediately see whether time was spent in `repo.Save` or `publisher.Publish`. Without tracing, you'd have two services, two sets of logs, and no way to see the boundary.
+
+## Metrics That Actually Matter
+
+The most useful metrics I've instrumented aren't infrastructure metrics — they're business-level signals:
+
+```go
+package metrics
+
+import (
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var (
+    OrdersProcessed = promauto.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "orders_processed_total",
+            Help: "Total orders processed, by status",
+        },
+        []string{"status", "tenant_id"},
+    )
+
+    OrderProcessingDuration = promauto.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "order_processing_duration_seconds",
+            Help:    "Order processing duration in seconds",
+            Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
+        },
+        []string{"stage"},
+    )
+
+    QueueDepth = promauto.NewGaugeVec(
+        prometheus.GaugeOpts{
+            Name: "queue_depth_messages",
+            Help: "Current queue depth by queue name",
+        },
+        []string{"queue_name"},
+    )
+
+    RetryRate = promauto.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "operation_retries_total",
+            Help: "Total retry attempts by operation",
+        },
+        []string{"operation", "reason"},
+    )
+)
+```
+
+The `RetryRate` metric is one I add to every system now. A rising retry rate is almost always the first signal of a degradation — it appears before latency climbs and before errors surface in user-facing requests. In multiple incidents, the retry rate alert fired 10–15 minutes before anything else turned red.
+
+## Alerts That Wake You Up for a Reason
+
+The worst outcome of poor observability isn't missing an incident — it's alert fatigue. Engineers stop trusting alerts, start ignoring them, and then miss the one that actually matters.
+
+My rule: **every alert must be actionable**. If you can't write a runbook entry for it, it shouldn't page anyone.
+
+```yaml
+groups:
+- name: order-service
+  rules:
+
+  # Alert on error rate, not on error count
+  - alert: HighErrorRate
+    expr: |
+      (
+        rate(orders_processed_total{status="error"}[5m]) /
+        rate(orders_processed_total[5m])
+      ) * 100 > 5
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Order error rate above 5% for 2 minutes"
+      runbook: "https://wiki.internal/runbooks/order-service#high-error-rate"
+
+  # Alert on queue depth, not on message count
+  - alert: QueueDepthCritical
+    expr: queue_depth_messages{queue_name="orders"} > 10000
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Order queue depth above 10k — processing may be lagging"
+
+  # Alert on P99 latency, not on average
+  - alert: HighProcessingLatency
+    expr: |
+      histogram_quantile(0.99,
+        rate(order_processing_duration_seconds_bucket[5m])
+      ) > 2
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "P99 order processing latency above 2s"
+```
+
+Three points worth noting:
+
+- **Rate over count**: alerting on raw error counts creates noise during traffic spikes. A 1% error rate during 100k req/min is worse than 50 errors during 1k req/min.
+- **P99 over average**: averages hide the tail. A slow P99 means real users are affected, even if the median looks fine.
+- **`for` duration**: requiring the condition to hold for 2–5 minutes before paging eliminates flapping alerts for transient spikes.
+
+## The Debugging Workflow This Enables
+
+When an alert fires, the investigation flow becomes deterministic:
+
+1. **Alert fires** with context: which service, which operation, which error rate.
+2. **Open the trace** for a representative failing request — the alert annotation links to a pre-filtered Jaeger/Grafana Tempo query.
+3. **Identify the span** where the failure originated — is it this service, or a downstream call?
+4. **Filter logs** by `trace_id` from that span to get the full narrative for that specific request.
+5. **Check business metrics** (retry rate, queue depth) to understand blast radius and whether the issue is isolated or systemic.
+
+Total time from alert to root cause identification: usually under 10 minutes. Before I had this setup in place, the same investigation would take 45 minutes to an hour, often involving multiple engineers piecing together context from different log streams.
+
+## What to Instrument First
+
+If you're starting from scratch, prioritize in this order:
+
+1. **Structured logs with request/trace ID propagation** — highest leverage, lowest overhead.
+2. **P99 latency and error rate per operation** — the two metrics that matter most for reliability.
+3. **Distributed traces on your critical paths** — the paths that, if broken, break the product.
+4. **Business-level metrics** (queue depth, retry rate, processing lag) — the signals that appear before things break visibly.
+5. **Correlation between all three** — logs linked to traces, traces linked to metrics, alerts linked to traces.
+
+You don't need expensive tooling to get started. `log/slog` + OpenTelemetry + Prometheus covers most of this and runs on any infrastructure.
+
+The goal isn't perfect observability — it's being able to answer *what, where, and why* fast enough that the person on call can make progress alone, at any hour, without needing to wake up anyone else.
