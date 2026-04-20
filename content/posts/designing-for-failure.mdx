@@ -1,20 +1,18 @@
 ---
-title: "Designing for failure: the question I ask every PR"
-description: "One question that will surface more production risk than any checklist: what happens when this fails?"
+title: "Designing for Failure: Fallbacks, Fault Tolerance, and Load Testing with k6"
+description: "One question surfaces more production risk than any checklist: what happens when this fails? Here's how to ask it, answer it with concrete patterns, and prove your answers hold under real load."
 date: "2026-03-14"
-tags: ["distributed-systems", "reliability", "engineering"]
+tags: ["distributed-systems", "reliability", "engineering", "k6", "load-testing"]
 featured: true
 ---
 
-The single most valuable habit I've built over the last decade is asking one
-question, on every non-trivial change I review or write:
+The single most valuable habit I've built over the last decade is asking one question, on every non-trivial change I review or write:
 
 > **What happens when this fails?**
 
-Not *if*. **When.** Every line of code you add is a new way for the system to
-fail, and the failure is never the part you were looking at when you wrote it.
+Not *if*. **When.** Every line of code you add is a new way for the system to fail, and the failure is never the part you were looking at when you wrote it.
 
-## A concrete example
+## A Concrete Example
 
 Consider a handler that enriches an event with data from a downstream service:
 
@@ -25,32 +23,430 @@ async function enrichEvent(event: Event): Promise<EnrichedEvent> {
 }
 ```
 
-This is the kind of code that looks fine, passes review, ships — and then one
-Tuesday at 3am, `userService` has a p99 of 12 seconds and your whole pipeline
-is wedged because nobody set a timeout.
+This is the kind of code that looks fine, passes review, ships — and then one Tuesday at 3am, `userService` has a p99 of 12 seconds and your whole pipeline is wedged because nobody set a timeout.
 
-Ask *what happens when this fails* and you immediately see the questions you
-forgot to answer:
+Ask *what happens when this fails* and you immediately see the questions you forgot to answer:
 
 - What's the timeout? (Not "the default" — what's the *number*?)
 - What do we do if the user isn't found? Drop the event? Dead-letter it?
 - Is this service call retriable, and if so, is the downstream idempotent?
 - Does this handler have a circuit breaker, or will we cascade?
 
-## The cheap fix
+## The Cheap Fix
 
-I'm not going to tell you to add all of those in every handler. The point of
-the question is not to write more code — it's to make the tradeoffs **visible**
-in the PR, so that "we decided not to handle that" is a conscious decision
-rather than an accident.
+I'm not going to tell you to add all of those in every handler. The point of the question is not to write more code — it's to make the tradeoffs **visible** in the PR, so that "we decided not to handle that" is a conscious decision rather than an accident.
 
-Most failures in production aren't from hard problems. They're from easy
-problems nobody bothered to look at.
+Most failures in production aren't from hard problems. They're from easy problems nobody bothered to look at.
 
-## What to do with it
+---
 
-Put the question on your PR template. Ask it in design reviews. Ask it of
-yourself before you open the PR. You'll ship fewer outages and — this is the
-part that surprised me — you'll write less code, because the moment you see the
-failure modes, a lot of the "robustness" you were planning turns out to be
-unnecessary.
+Asking the question is the start. The rest of this article is about *answering* it — with fallbacks, fault tolerance patterns, and load tests that prove they hold under real conditions.
+
+## Fallbacks: What the System Does When It Can't Do the Right Thing
+
+A fallback is the answer to "what do we return when the dependency is unavailable?" Most code has no answer. That means the error propagates up, the request fails, and the user sees it.
+
+There are three fallback tiers, in order of quality:
+
+**1. Stale cache** — serve the last known good value. Best for data that changes slowly and where approximate results are acceptable.
+
+```ts
+async function enrichEvent(event: Event): Promise<EnrichedEvent> {
+  let user: User | null = null;
+
+  try {
+    user = await withTimeout(userService.getById(event.userId), 500);
+    await cache.set(`user:${event.userId}`, user, { ttl: 300 });
+  } catch {
+    user = await cache.get(`user:${event.userId}`);
+  }
+
+  if (!user) {
+    // No cache hit either — fall through to degraded response
+    return { ...event, user: { id: event.userId, name: 'Unknown', degraded: true } };
+  }
+
+  return { ...event, user };
+}
+```
+
+**2. Safe default** — return a response that is technically incorrect but safe. Use this when stale data doesn't exist or would be worse than a known default.
+
+```ts
+async function getUserCreditLimit(userId: string): Promise<number> {
+  try {
+    return await withTimeout(creditService.getLimit(userId), 300);
+  } catch {
+    // Conservative default: don't extend credit when we can't verify
+    return 0;
+  }
+}
+```
+
+**3. Degraded mode** — serve a reduced version of the feature rather than failing entirely. The classic example is a product page that loads without personalized recommendations when the recommendation service is down.
+
+The important thing is that all three are **deliberate choices**, not accidents. Decide which tier applies to each dependency, document it, and test it.
+
+## Fault Tolerance Patterns
+
+### Timeouts
+
+Every external call needs an explicit timeout. Not the SDK default — a number you chose deliberately based on your SLA and the upstream's expected latency.
+
+```ts
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+```
+
+A good starting point: set the timeout at 2× your upstream's P99. If the upstream's P99 is 200ms, a 400ms timeout catches degradation without triggering on normal variance.
+
+### Retry with Exponential Backoff and Jitter
+
+Retries are only safe when the downstream is idempotent. Given that constraint, exponential backoff with jitter prevents retry storms when a service is recovering:
+
+```ts
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  options: { maxAttempts: number; baseDelayMs: number }
+): Promise<T> {
+  let lastError: Error;
+
+  for (let attempt = 1; attempt <= options.maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err as Error;
+
+      if (attempt === options.maxAttempts) break;
+
+      // Exponential backoff with full jitter
+      const exponential = options.baseDelayMs * Math.pow(2, attempt - 1);
+      const jitter = Math.random() * exponential;
+      await sleep(jitter);
+    }
+  }
+
+  throw lastError!;
+}
+```
+
+The jitter is critical. Without it, every instance retries at the same time, creating a synchronized spike that overwhelms a service that's trying to recover.
+
+### Circuit Breaker
+
+A circuit breaker stops calling a dependency that is clearly failing, gives it time to recover, and probes cautiously before resuming full traffic.
+
+```ts
+type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+
+class CircuitBreaker {
+  private state: CircuitState = 'CLOSED';
+  private failureCount = 0;
+  private lastFailureTime = 0;
+
+  constructor(
+    private readonly threshold: number,      // failures before opening
+    private readonly recoveryMs: number      // time before probing again
+  ) {}
+
+  async execute<T>(fn: () => Promise<T>, fallback: () => T): Promise<T> {
+    if (this.state === 'OPEN') {
+      if (Date.now() - this.lastFailureTime > this.recoveryMs) {
+        this.state = 'HALF_OPEN';
+      } else {
+        return fallback();
+      }
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      return fallback();
+    }
+  }
+
+  private onSuccess() {
+    this.failureCount = 0;
+    this.state = 'CLOSED';
+  }
+
+  private onFailure() {
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+    if (this.failureCount >= this.threshold) {
+      this.state = 'OPEN';
+    }
+  }
+
+  getState(): CircuitState {
+    return this.state;
+  }
+}
+```
+
+Usage wiring the patterns together:
+
+```ts
+const userServiceBreaker = new CircuitBreaker(5, 10_000);
+
+async function enrichEvent(event: Event): Promise<EnrichedEvent> {
+  const user = await userServiceBreaker.execute(
+    () => withRetry(
+      () => withTimeout(userService.getById(event.userId), 400),
+      { maxAttempts: 2, baseDelayMs: 50 }
+    ),
+    () => ({ id: event.userId, name: 'Unknown', degraded: true })
+  );
+
+  return { ...event, user };
+}
+```
+
+When `userService` starts failing: retries absorb transient errors → circuit breaker opens after 5 consecutive failures → subsequent calls go directly to the fallback without hitting the failing service → the service gets breathing room to recover → after 10 seconds the breaker half-opens and lets one request through as a probe.
+
+### Bulkhead
+
+A bulkhead limits the number of concurrent calls to a dependency, preventing one slow upstream from exhausting your thread pool or connection pool and taking down unrelated operations.
+
+```ts
+class Bulkhead {
+  private active = 0;
+
+  constructor(private readonly maxConcurrent: number) {}
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.active >= this.maxConcurrent) {
+      throw new Error(`Bulkhead limit reached (${this.maxConcurrent} concurrent)`);
+    }
+
+    this.active++;
+    try {
+      return await fn();
+    } finally {
+      this.active--;
+    }
+  }
+}
+
+const userServiceBulkhead = new Bulkhead(20);
+```
+
+Combine with the circuit breaker: the bulkhead caps concurrent load, the circuit breaker stops load entirely when the service is failing.
+
+## Proving It Works: Load Testing with k6
+
+Writing the patterns is the easy part. Proving they hold under real traffic conditions requires load tests designed to trigger the failure modes you've defended against.
+
+k6 is my tool of choice — tests in JavaScript, clean API, excellent CI integration.
+
+### Baseline: Validate Normal Behavior
+
+Start by establishing what "working correctly" looks like under load:
+
+```js
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Rate, Trend } from 'k6/metrics';
+
+const errorRate = new Rate('error_rate');
+const enrichLatency = new Trend('enrich_event_latency', true);
+
+export const options = {
+  stages: [
+    { duration: '1m', target: 50 },   // ramp up
+    { duration: '3m', target: 50 },   // steady state
+    { duration: '1m', target: 0 },    // ramp down
+  ],
+  thresholds: {
+    error_rate: ['rate<0.01'],                      // < 1% errors
+    enrich_event_latency: ['p(99)<500'],            // P99 < 500ms
+    http_req_duration: ['p(95)<300'],               // P95 < 300ms
+  },
+};
+
+export default function () {
+  const res = http.post(
+    'http://localhost:3000/events/enrich',
+    JSON.stringify({ userId: `user-${Math.floor(Math.random() * 1000)}` }),
+    { headers: { 'Content-Type': 'application/json' } }
+  );
+
+  check(res, {
+    'status is 200': (r) => r.status === 200,
+    'has user field': (r) => JSON.parse(r.body).user !== undefined,
+  });
+
+  errorRate.add(res.status !== 200);
+  enrichLatency.add(res.timings.duration);
+
+  sleep(1);
+}
+```
+
+### Fault Injection: Simulate a Slow Downstream
+
+The most important test: what happens when the upstream degrades? This scenario is where timeouts, circuit breakers, and fallbacks earn their place:
+
+```js
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Rate } from 'k6/metrics';
+
+const fallbackRate = new Rate('fallback_rate');
+const errorRate = new Rate('error_rate');
+
+export const options = {
+  stages: [
+    { duration: '2m', target: 100 },  // normal load
+    { duration: '3m', target: 100 },  // inject latency via toxiproxy or feature flag
+    { duration: '2m', target: 100 },  // recovery
+  ],
+  thresholds: {
+    // Even with a slow upstream, hard errors should stay near zero
+    error_rate: ['rate<0.05'],
+    // Fallback should activate — this is success, not failure
+    http_req_duration: ['p(99)<600'],
+  },
+};
+
+export default function () {
+  const res = http.post(
+    'http://localhost:3000/events/enrich',
+    JSON.stringify({ userId: `user-${__VU}` }),
+    { headers: { 'Content-Type': 'application/json' } }
+  );
+
+  const body = JSON.parse(res.body);
+
+  check(res, {
+    'request completed': (r) => r.status === 200 || r.status === 206,
+    'no 500 errors': (r) => r.status !== 500,
+  });
+
+  // Track how often we served a degraded/fallback response
+  fallbackRate.add(body.user?.degraded === true);
+  errorRate.add(res.status >= 500);
+
+  sleep(0.5);
+}
+```
+
+Run this while using [Toxiproxy](https://github.com/Shopify/toxiproxy) or a feature flag to inject 2–3 second latency into the upstream. What you should see:
+
+- Error rate stays near 0% (fallbacks absorb the failures)
+- P99 latency stays bounded (timeouts fire, circuit opens)
+- `fallback_rate` rises and falls in sync with the injected fault
+
+If `error_rate` spikes instead, your timeout or circuit breaker isn't wired correctly.
+
+### Validating Circuit Breaker Behavior
+
+This test verifies the circuit opens and closes correctly:
+
+```js
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Trend } from 'k6/metrics';
+
+const circuitStateLatency = new Trend('response_when_open', true);
+
+export const options = {
+  vus: 20,
+  duration: '2m',
+};
+
+export default function () {
+  const start = Date.now();
+  const res = http.get('http://localhost:3000/health/circuit-state');
+
+  // When the circuit is open, responses should be near-instant (no network call)
+  // When closed, responses take normal service latency
+  const duration = Date.now() - start;
+
+  check(res, {
+    'circuit info present': (r) => JSON.parse(r.body).circuitState !== undefined,
+  });
+
+  const body = JSON.parse(res.body);
+  if (body.circuitState === 'OPEN') {
+    circuitStateLatency.add(duration);
+    // Assert fallback responses are fast: circuit open = no downstream call
+    check({ duration }, {
+      'fallback is fast when circuit open': (d) => d.duration < 50,
+    });
+  }
+
+  sleep(0.2);
+}
+```
+
+Expose a `/health/circuit-state` endpoint in your service to make this testable. The circuit state is runtime information — make it visible.
+
+### Load Test in CI
+
+Run a smoke test on every PR to catch regressions before they reach staging:
+
+```yaml
+# .github/workflows/load-test.yml
+name: Load Test
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+
+jobs:
+  k6:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start services
+        run: docker compose up -d
+        
+      - name: Wait for readiness
+        run: |
+          until curl -sf http://localhost:3000/health; do sleep 1; done
+
+      - name: Run k6 smoke test
+        uses: grafana/k6-action@v0.3.1
+        with:
+          filename: tests/load/smoke.js
+        env:
+          K6_VUS: 10
+          K6_DURATION: 30s
+
+      - name: Publish results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-results
+          path: results.json
+```
+
+A 30-second smoke test with 10 VUs adds under a minute to your pipeline and will catch timeout misconfiguration, missing fallbacks, and circuit breaker wiring issues before any human reviews the code.
+
+## Putting It Together
+
+The question — *what happens when this fails?* — gives you the frame. The patterns give you the vocabulary to answer it:
+
+| Failure scenario | Pattern |
+|---|---|
+| Dependency is slow | Timeout + fallback |
+| Transient errors | Retry with backoff + jitter |
+| Dependency is down | Circuit breaker + fallback |
+| Dependency is overwhelmed | Bulkhead |
+| Degraded but usable response | Stale cache / safe default |
+
+And k6 gives you the proof. A resilience design that hasn't been tested under failure conditions is a hypothesis, not a guarantee. Fault injection tests are how you turn "I think this will hold" into "I've seen it hold."
+
+Put the question on your PR template. Wire the patterns where the answers demand them. And before you ship, break it on purpose — it's the only way to know it won't break on its own.

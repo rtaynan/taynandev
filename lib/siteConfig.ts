@@ -19,9 +19,9 @@ export const siteConfig = {
   // Companies you've worked at — shown as a subtle proof strip under the hero.
   // Order matters (most relevant first). Keep to 3–6 entries.
   companies: [
-    { name: "Company A", url: "https://example.com" },
-    { name: "Company B", url: "https://example.com" },
-    { name: "Company C", url: "https://example.com" },
+    { name: "iFood", url: "https://institucional.ifood.com.br/sobre/" },
+    { name: "Coinbase", url: "https://www.coinbase.com/" },
+    { name: "TOTVS", url: "https://www.totvs.com/" },
   ],
 
   // One-line impact statements recruiters / clients can scan in 2 seconds.
@@ -46,9 +46,14 @@ export const siteConfig = {
   // Drop a PDF at public/resume.pdf (or change this path).
   resumeUrl: "/resume.pdf",
 
+  phones: [
+    { number: "+55 (62) 98250-4105", label: "Call or text", href: "tel:+5562982504105" },
+    { number: "+1 (305) 481-7460", label: "Text", href: "sms:+13054817460" },
+  ],
+
   social: {
     github: "https://github.com/taynandev",
-    linkedin: "https://www.linkedin.com/in/taynan-rezende/",
+    linkedin: "https://www.linkedin.com/in/taynanrezende/",
     x: "https://x.com/taynandev",
   },
 

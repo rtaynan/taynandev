@@ -1,0 +1,255 @@
+---
+title: "Distributed Transactions Without Two-Phase Commit: The Saga Pattern in Production"
+description: "Two-phase commit doesn't scale. Here's how I handle consistency across microservices in production using the Saga pattern — with real failure modes, idempotency requirements, and SQS-backed choreography."
+date: "2026-04-20"
+tags: ["distributed-systems", "architecture", "aws", "sqs", "golang"]
+featured: false
+---
+
+Every microservices architecture eventually faces the same question: how do you keep data consistent across services when a multi-step operation partially fails?
+
+The intuitive answer is a distributed transaction. Lock the resources, commit or roll back atomically, done. That's two-phase commit (2PC), and it's the right answer for a monolith with a single database. For a distributed system under real traffic, it's a reliability and scalability trap: it couples service availability, creates lock contention across network boundaries, and turns a timeout in any participant into a blocked transaction that takes everything down with it.
+
+The answer I've settled on in production is the **Saga pattern** — a sequence of local transactions, each publishing an event, with compensating transactions to undo completed steps if something downstream fails. It trades atomicity for availability, and when implemented correctly, it's the right trade.
+
+## The Problem: Why You Can't Just Use Transactions
+
+Consider an order processing flow that spans three services:
+
+1. **Order Service** — creates the order record
+2. **Inventory Service** — reserves the items
+3. **Payment Service** — charges the customer
+
+In a monolith with one database, this is a single transaction. In a microservices architecture, each service owns its own database. There is no shared transaction boundary.
+
+The naive approach is to call the services in sequence and hope nothing fails mid-way:
+
+```go
+// This looks fine. It is not fine.
+func (h *OrderHandler) Create(ctx context.Context, req CreateOrderRequest) error {
+    order, err := h.orderService.Create(ctx, req)
+    if err != nil {
+        return err
+    }
+
+    if err := h.inventoryService.Reserve(ctx, order.ID, req.Items); err != nil {
+        // Order was created. Inventory wasn't reserved. Now what?
+        return err
+    }
+
+    if err := h.paymentService.Charge(ctx, order.ID, req.Payment); err != nil {
+        // Order created. Inventory reserved. Payment failed.
+        // The customer sees an error. The inventory is stuck reserved.
+        return err
+    }
+
+    return nil
+}
+```
+
+Every partial failure leaves the system in an inconsistent state. You can add cleanup code, but now you're implementing compensations manually, without any guarantees about *those* calls succeeding.
+
+## The Saga Pattern
+
+A Saga breaks the multi-step operation into a sequence of local transactions, each of which publishes an event when it completes. If any step fails, the Saga executes *compensating transactions* — also local, also durable — to undo the effects of the steps that already completed.
+
+**Two implementation styles:**
+
+- **Choreography**: each service publishes events and reacts to events from other services. No central coordinator. Works well for simple flows.
+- **Orchestration**: a central saga orchestrator tells each service what to do and tracks the state. More explicit, easier to reason about for complex flows.
+
+I prefer orchestration for anything beyond 3 steps. The central state makes failures visible and debugging tractable.
+
+## Orchestration with SQS
+
+Here's a simplified implementation of an order Saga orchestrator using SQS as the message transport:
+
+```go
+package saga
+
+type OrderSagaState string
+
+const (
+    OrderSagaStateStarted            OrderSagaState = "STARTED"
+    OrderSagaStateInventoryReserved  OrderSagaState = "INVENTORY_RESERVED"
+    OrderSagaStatePaymentCharged     OrderSagaState = "PAYMENT_CHARGED"
+    OrderSagaStateCompleted          OrderSagaState = "COMPLETED"
+    OrderSagaStateCompensating       OrderSagaState = "COMPENSATING"
+    OrderSagaStateFailed             OrderSagaState = "FAILED"
+)
+
+type OrderSaga struct {
+    ID        string
+    OrderID   string
+    State     OrderSagaState
+    CreatedAt time.Time
+    UpdatedAt time.Time
+}
+
+type SagaOrchestrator struct {
+    sagaRepo  SagaRepository   // DynamoDB — stores saga state
+    publisher MessagePublisher  // SQS — sends commands to services
+}
+
+func (o *SagaOrchestrator) Start(ctx context.Context, orderID string) error {
+    saga := &OrderSaga{
+        ID:        uuid.New().String(),
+        OrderID:   orderID,
+        State:     OrderSagaStateStarted,
+        CreatedAt: time.Now(),
+    }
+
+    if err := o.sagaRepo.Save(ctx, saga); err != nil {
+        return fmt.Errorf("save saga: %w", err)
+    }
+
+    return o.publisher.Publish(ctx, ReserveInventoryCommand{
+        SagaID:  saga.ID,
+        OrderID: orderID,
+    })
+}
+
+func (o *SagaOrchestrator) OnInventoryReserved(ctx context.Context, event InventoryReservedEvent) error {
+    saga, err := o.sagaRepo.GetBySagaID(ctx, event.SagaID)
+    if err != nil {
+        return err
+    }
+
+    saga.State = OrderSagaStateInventoryReserved
+    saga.UpdatedAt = time.Now()
+
+    if err := o.sagaRepo.Save(ctx, saga); err != nil {
+        return err
+    }
+
+    return o.publisher.Publish(ctx, ChargePaymentCommand{
+        SagaID:  saga.ID,
+        OrderID: saga.OrderID,
+    })
+}
+
+func (o *SagaOrchestrator) OnPaymentFailed(ctx context.Context, event PaymentFailedEvent) error {
+    saga, err := o.sagaRepo.GetBySagaID(ctx, event.SagaID)
+    if err != nil {
+        return err
+    }
+
+    saga.State = OrderSagaStateCompensating
+    saga.UpdatedAt = time.Now()
+
+    if err := o.sagaRepo.Save(ctx, saga); err != nil {
+        return err
+    }
+
+    // Trigger compensation: release the inventory that was reserved
+    return o.publisher.Publish(ctx, ReleaseInventoryCommand{
+        SagaID:  saga.ID,
+        OrderID: saga.OrderID,
+        Reason:  "payment_failed",
+    })
+}
+```
+
+The saga state is persisted to DynamoDB before each command is published. This is critical: if the process crashes between saving state and publishing the command, a recovery process can inspect the state and re-publish the command. The alternative — publish first, then save state — risks publishing a command that never gets tracked.
+
+## Idempotency Is Non-Negotiable
+
+Every handler in a Saga must be idempotent. SQS delivers messages at least once — the same event will arrive more than once under failure conditions. If `ReserveInventory` isn't idempotent, a double-delivery creates a double reservation.
+
+The pattern I use is a deduplication table — simple, durable, cheap:
+
+```go
+func (s *InventoryService) Reserve(ctx context.Context, cmd ReserveInventoryCommand) error {
+    // Attempt to write a deduplication record — fails if already processed
+    dedupKey := fmt.Sprintf("reserve:%s", cmd.SagaID)
+    inserted, err := s.dedupRepo.InsertIfNotExists(ctx, dedupKey, 24*time.Hour)
+    if err != nil {
+        return fmt.Errorf("dedup check: %w", err)
+    }
+    if !inserted {
+        // Already processed — this is a safe duplicate, return success
+        return nil
+    }
+
+    // First time seeing this command — process it
+    return s.reserveItems(ctx, cmd.OrderID, cmd.Items)
+}
+```
+
+In DynamoDB, `InsertIfNotExists` is a conditional write on the dedup key with a TTL. The operation costs a single write unit and gives you at-exactly-once processing semantics on top of at-least-once delivery.
+
+## Compensating Transactions: Design Them Upfront
+
+Compensations are the hardest part to get right because they're rarely tested until something breaks in production.
+
+A few rules I follow:
+
+**Compensations must also be idempotent.** The same reasoning applies — they'll be retried on failure.
+
+**Not every step can be perfectly compensated.** Charging a payment can be compensated with a refund, but a refund is a new transaction with its own failure modes. Model this explicitly, not as an implicit rollback.
+
+**Compensations don't bring you back to "never happened."** They bring you to a *semantically consistent* state. Communicate this to product and ops so that compensated orders are handled correctly (e.g., shown to support teams, not silently dropped).
+
+```go
+type CompensationStep struct {
+    Name        string
+    Execute     func(ctx context.Context, saga *OrderSaga) error
+    IsCompleted func(saga *OrderSaga) bool
+}
+
+var compensationSteps = []CompensationStep{
+    {
+        Name: "release_inventory",
+        Execute: func(ctx context.Context, saga *OrderSaga) error {
+            return inventoryService.Release(ctx, saga.OrderID)
+        },
+        IsCompleted: func(saga *OrderSaga) bool {
+            return saga.InventoryReleased
+        },
+    },
+    {
+        Name: "refund_payment",
+        Execute: func(ctx context.Context, saga *OrderSaga) error {
+            if !saga.PaymentCharged {
+                return nil // Nothing to refund
+            }
+            return paymentService.Refund(ctx, saga.OrderID)
+        },
+        IsCompleted: func(saga *OrderSaga) bool {
+            return saga.PaymentRefunded
+        },
+    },
+}
+```
+
+Executing compensations in reverse order, skipping steps that weren't reached, ensures you only undo what was actually done.
+
+## Failure Modes to Design For
+
+**The orchestrator crashes mid-saga.** Handled by persisting state before each command. On restart, query DynamoDB for in-flight sagas and re-publish the pending command.
+
+**A service is unavailable.** SQS retries with backoff. The saga stays in its current state until the command is eventually processed. Design your SQS Dead Letter Queue to surface sagas that are stuck after N retries.
+
+**A compensation fails.** This is the hardest case. Persist the compensation failure explicitly and route it to a manual intervention queue. Some failures genuinely require human action — build that path into the design rather than pretending it won't happen.
+
+**Clock skew and out-of-order events.** Use the saga state machine to validate that events arrive in the expected sequence. An `InventoryReserved` event that arrives after `PaymentFailed` compensation has already started should be a no-op, not a trigger for further progression.
+
+## When to Use Sagas (and When Not To)
+
+Sagas are the right tool when:
+
+- You have 3+ steps across service boundaries
+- Steps involve external systems (payment processors, shipping APIs) that can't participate in a shared transaction
+- You need the system to remain available even when individual services are down
+
+They're overkill when:
+
+- Two services share a database — just use a local transaction
+- The operation is inherently sequential and single-service
+- The "distributed transaction" is actually a read-heavy operation with occasional writes — eventual consistency might be sufficient without explicit compensation
+
+The overhead is real: more code, more infrastructure, more failure modes to handle explicitly. The payoff is a system that degrades gracefully instead of deadlocking under pressure.
+
+---
+
+Two-phase commit is elegant on paper. In production, at scale, with network partitions and partial failures, it becomes the thing that takes your whole system down when one service is slow. Sagas trade that elegance for resilience — and resilience is the one you want at 3am.
