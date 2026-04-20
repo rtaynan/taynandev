@@ -1,0 +1,109 @@
+---
+title: "How I Reduced My DynamoDB Costs by 91% with a Simple Data Model Change"
+description: "From $20,000 to $1,800/month — no infrastructure change, no migration to another service. Just a better data model."
+date: "2026-04-09"
+tags: ["aws", "dynamodb", "cost-optimization", "data-modeling"]
+featured: true
+---
+
+I was managing a DynamoDB table receiving approximately **45 billion write events monthly**, costing around **$20,000 USD per month**. The system recorded events for auction decisions — each involving a single `auction_id` and multiple `customer_ids`, averaging 7 events per `auction_id <> customer_id` combination.
+
+It looked straightforward. It wasn't.
+
+## The Problem
+
+The write volume itself wasn't the problem. The problem was that I was paying for capacity I wasn't using — and DynamoDB's billing model was punishing me for it in a way that wasn't obvious until I looked closely.
+
+## Understanding How DynamoDB Charges
+
+DynamoDB charges based on WCU (Write Capacity Units):
+
+> **1 WCU = 1 write per second for items up to 1 KB. DynamoDB always rounds up to the next KB.**
+
+In practice:
+
+| Item size | Billed as |
+|---|---|
+| 1 byte | 1 KB |
+| 999 bytes | 1 KB |
+| 1.1 KB | 2 KB |
+
+At **$0.00065 per WCU**, with items of ~155 bytes each, I was paying for 6× the capacity I was actually using. Every write consumed 1 WCU regardless of item size — and my items were tiny.
+
+## Before vs. After
+
+**Before:** each event was a separate item.
+
+```
+7 items × 155 bytes = 7 WCUs consumed
+```
+
+**After:** all customers for a given `auction_id` aggregated into a single item.
+
+```
+1 item × ~1.2 KB = 2 WCUs consumed
+```
+
+## The Solution: Aggregation
+
+Instead of one item per `auction_id <> customer_id` pair, I grouped all customers under their `auction_id` into a single map:
+
+```json
+{
+  "auction_id": "auction-12345",
+  "customer_cpc_map": {
+    "customer-123": 0.50,
+    "customer-456": 0.75,
+    "customer-789": 1.20,
+    "customer-abc": 0.35,
+    "customer-xyz": 2.00
+  },
+  "ttl": 1733097600
+}
+```
+
+### The math
+
+```
+7 events × 155 bytes     =  1,085 bytes
+JSON overhead            ~    100 bytes
+Total                    ~  1,185 bytes
+Rounded up by DynamoDB   =  2 KB = 2 WCUs
+```
+
+**71% reduction per write operation** — and that compounds across 45 billion writes.
+
+## Final Result
+
+| Metric | Before | After |
+|---|---|---|
+| WCUs/month | 45,427,709,426 | 4,075,335,487 |
+| Monthly cost | $20,000 | $1,800 |
+| Annual cost | $240,000 | $21,600 |
+| **Annual savings** | | **$218,400** |
+
+**91% reduction.** No infrastructure migration, no service swap.
+
+## Unexpected Benefits
+
+The dramatic reduction in stored items also resolved TTL cleanup performance issues that had been a low-grade annoyance for months. Lookups for a specific customer just accessed the key inside the map — negligible CPU overhead.
+
+Migration was done with shadow writes and feature toggles to avoid any risk.
+
+## Trade-offs Worth Knowing
+
+This approach isn't free. Before applying it, make sure you've thought through:
+
+- **Item size limit** — DynamoDB caps items at 400 KB. If your maps can grow unboundedly, aggregation has a ceiling.
+- **Concurrency** — multiple writers updating the same item simultaneously may need conditional writes or retry logic.
+- **Partial updates** — updating a single customer value requires writing the entire item, not just the changed field.
+
+In my case the benefits substantially outweighed these. Your mileage depends on your access patterns.
+
+**Tip:** for items that push against the 400 KB limit, compression can extend how far aggregation scales.
+
+---
+
+> The biggest cloud optimizations usually don't come from infrastructure changes. They come from better data modeling.
+
+Most DynamoDB cost problems I've seen aren't architectural. They're a mismatch between how the data is modeled and how DynamoDB's billing actually works. Understand the billing unit, then design the item shape around it.

@@ -1,0 +1,200 @@
+---
+title: "Migrating 10 Years of SVN History to Git — and Cutting Release Time from Days to Hours"
+description: "How I migrated a decade-old Subversion repository to Git without losing a single commit, unlocking a pipeline rewrite that took customer releases from more than a day to a few hours."
+date: "2019-12-06"
+tags: ["git", "svn", "migration", "ci-cd", "devops"]
+---
+
+A decade of commits. Hundreds of contributors. A Subversion repository that had outgrown its tooling — and a release pipeline so slow and fragile that shipping a new version to customers required a full day of engineers on standby.
+
+This is the story of how I migrated that repository to Git without losing a single commit, and the pipeline rewrite it enabled — which took our release cycle from **more than a day** to **a handful of hours**.
+
+## The Release Pipeline That Ate a Day
+
+Before the migration, our release process ran on Jenkins against the SVN repository. To ship a new version to customers, the team had to block out an entire working day:
+
+- **The pipeline was slow.** SVN's design made operations that are effectively free in Git — branching, merging, tagging — expensive. Every release step that touched history carried that cost.
+- **Failures were frequent.** When the pipeline broke partway through, there was no easy resume. An engineer had to diagnose, clean up, and restart the entire process from the beginning.
+- **It required a standing army.** Multiple engineers had to stay on call during every release in case something went wrong mid-pipeline. That's headcount spent on babysitting a deploy, not shipping value.
+- **Average release time: over a day.** Features and fixes that were "done" in engineering sat in the queue because the bottleneck wasn't writing code — it was delivering it.
+
+It wasn't sustainable. I volunteered to drive the migration off SVN.
+
+## Why Preserving the Full History Mattered
+
+The easy path would have been to snapshot `trunk` into a fresh Git repository and move on. I refused to do that.
+
+Ten years of history is ten years of `git blame`. It's the context for every weird-looking workaround, every hotfix, every decision that looked obvious in the moment and needs explaining three years later. Losing it would have saved a week of migration work and cost us *years* of institutional knowledge.
+
+The goal I set: every SVN commit maps to a Git commit, with the original author, date, and message intact.
+
+## The Migration, Step by Step
+
+### 1. Work from Linux
+
+The tooling chain — `git-svn`, Atlassian's `svn-migration-scripts.jar`, the cleanup utilities — is most reliable on Linux. Don't fight it from Windows or macOS; spin up a Linux VM if you need to.
+
+### 2. Install the toolchain
+
+You'll need:
+
+- `svn-migration-scripts.jar` (Atlassian)
+- Java Runtime Environment
+- Git
+- Subversion
+- `git-svn`
+
+Verify the environment:
+
+```bash
+java -jar ~/svn-migration-scripts.jar verify
+```
+
+### 3. Build the authors file
+
+SVN identifies users by username alone. Git needs a full name and email on every commit. The migration script generates a starter `authors.txt` that maps one to the other:
+
+```bash
+java -jar svn-migration-scripts.jar authors <SVN_REPO_URL> > authors.txt
+```
+
+Open the file and fill in real names and emails for every user. This is tedious and it's worth doing carefully — these values get baked into every commit and showing up incorrectly on thousands of them will haunt you.
+
+### 4. Clone the SVN repo into Git
+
+The command depends on your repository's layout.
+
+**Standard SVN layout** (`trunk`, `branches`, `tags`):
+
+```bash
+git svn clone --stdlayout \
+  --authors-file=authors.txt \
+  <SVN_REPO_URL> <new_git_repo_name>
+```
+
+**Custom layout** (our case — the repo had evolved over a decade and didn't follow the Atlassian convention):
+
+```bash
+git svn clone --prefix='' \
+  --trunk=/<relative_trunk_path> \
+  --authors-file=authors.txt \
+  <SVN_REPO_URL> <new_git_repo_name>
+```
+
+I always pass `--prefix=''` — it makes subsequent `git svn fetch` syncs behave more predictably if you need to keep the two repos in sync during a transition period.
+
+This step takes a while on a large repo. For ours, it ran overnight.
+
+### 5. Clean up SVN artifacts
+
+The fresh clone still has SVN metadata attached to branches and tags. Strip it:
+
+```bash
+java -Dfile.encoding=utf-8 -jar ~/svn-migration-scripts.jar clean-git
+```
+
+Review what it plans to do, then run with `--force` to actually apply the cleanup:
+
+```bash
+java -Dfile.encoding=utf-8 -jar ~/svn-migration-scripts.jar clean-git --force
+```
+
+### 6. Push to the new Git remote
+
+```bash
+git remote add origin <NEW_GIT_REMOTE_URL>
+git push -u origin --all
+git push -u origin --tags
+```
+
+## Keeping the Two Repos in Sync During the Cutover
+
+You don't do a migration like this in a single flip. During the cutover window — while teams are still landing changes on SVN and the new Git remote is being validated — you need to pull ongoing SVN changes into the Git clone.
+
+Fetch new revisions:
+
+```bash
+git svn fetch
+```
+
+Then apply them on top, preserving linear history:
+
+```bash
+java -Dfile.encoding=utf-8 -jar ~/svn-migration-scripts.jar sync-rebase
+```
+
+Verify:
+
+```bash
+git log
+```
+
+Re-run the cleanup step and push:
+
+```bash
+java -Dfile.encoding=utf-8 -jar ~/svn-migration-scripts.jar clean-git --force
+git push
+```
+
+I ran this sync on a schedule during the two-week overlap window. Once the last SVN commit was mirrored and Jenkins was fully cut over to Git, we froze SVN writes and the migration was done.
+
+## The Payoff: Days to Hours
+
+The migration itself was just the enabler. The real win came from what we could now do with Jenkins.
+
+With the repository on Git — and hosted on Bitbucket — I rewrote our Jenkins pipeline from the ground up. Instead of a monolithic, slow, failure-prone process built around SVN's constraints, we ended up with a pipeline that was branching-friendly, parallelizable, and — crucially — resumable when something went wrong.
+
+| | Before (SVN) | After (Git + Bitbucket + new Jenkins) |
+|---|---|---|
+| Average release time to customers | **> 1 working day** | **a few hours** |
+| Engineers required during release | Multiple, on standby | Triggered and monitored by one engineer |
+| Pipeline failures | Common; required full restart from scratch | Rare; automated retries on transient failures |
+| Feature/fix delivery cadence | Gated by the release bottleneck | Gated by engineering, not by the pipeline |
+
+The second row is the one I'm most proud of. Before, releases consumed a slice of every senior engineer's day. After, they happened in the background — the team got that time back, permanently.
+
+## The Cost We Reclaimed
+
+The calendar-time win is easy to see. The dollar and capacity wins took a bit more math — but they're where the real return on the project lived.
+
+### Engineer hours, compounding
+
+The old pipeline required *multiple* engineers to stay blocked off during every release: two to three senior engineers on standby for the better part of a working day, ready to intervene whenever the pipeline failed mid-run.
+
+Running the numbers with conservative assumptions:
+
+| | Before | After |
+|---|---|---|
+| Engineers tied up per release | ~3 | 1 |
+| Duration per release | ~8 hours (full day) | ~2 hours |
+| Engineer-hours per release | **~24** | **~2** |
+
+That's roughly **22 engineer-hours saved per release**. At the team's release cadence, it compounded to somewhere in the range of **400–600 engineer-hours per year reclaimed** — about three months of full-time engineering capacity that used to evaporate into release babysitting and now went into shipping features and fixes instead.
+
+And that's before counting the **context-switch tax**. Engineers who knew they were on release duty couldn't start deep work that day — they had to stay available for the inevitable failure. That cost doesn't appear on any timesheet, but anyone who's done on-call knows how real it is.
+
+### Infrastructure you stop paying for
+
+The old SVN setup required us to run and maintain:
+
+- A primary SVN server (Apache + Subversion on a dedicated VM)
+- A disaster-recovery replica
+- Dedicated backup storage with retention
+- The operational overhead of patching, monitoring, and troubleshooting all of it
+
+Moving to Bitbucket Cloud replaced every item on that list with a per-user subscription. For a mid-sized engineering organization, the net effect typically lands somewhere in the range of **$8–15K per year in avoided infrastructure spend**, on top of the operational time the team used to burn keeping the cluster alive.
+
+### The combined picture
+
+Engineer hours back in the build queue. Infrastructure no longer on the cloud bill. Operational toil removed from the team's plate. The migration wasn't free — it took weeks of focused work and a careful cutover — but the ROI paid back in well under a year, and it keeps paying every release since.
+
+## What I Learned
+
+A few things stuck with me from this project:
+
+- **Preserving history pays off forever.** The migration cost two extra weeks of work to do it right. Every `git blame` since has paid that back.
+- **The migration wasn't the win — the rewrite it enabled was.** If we'd migrated to Git and kept the same pipeline shape, we would have gotten maybe a 20% improvement. The "days to hours" jump came from restructuring the pipeline around Git's primitives (cheap branches, fast operations, clean merges).
+- **Gradual cutover beats big-bang.** Running SVN and Git in parallel for two weeks, with `git svn fetch` + `sync-rebase` keeping them in sync, meant we could validate the new pipeline on real traffic before burning the bridge.
+- **Tooling pain compounds silently.** "We lose a day every release" sounds manageable until you multiply it by release frequency and the headcount involved. The ROI on fixing it was obvious in retrospect.
+
+If you're on a legacy VCS today and the release process is what's slowing you down, the migration probably isn't the scary part — it's the forcing function that lets you fix everything downstream of it.

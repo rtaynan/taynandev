@@ -1,0 +1,199 @@
+---
+title: "60x Faster: How I Optimized FIFO SQS Throughput in Go"
+description: "From 2 minutes to 2 seconds for 924 messages — two targeted changes I made to our messaging layer, no infrastructure swap required."
+date: "2026-04-20"
+tags: ["aws", "sqs", "golang", "performance"]
+featured: true
+---
+
+I was working on a campaign processing pipeline that was sending 924 messages to an AWS SQS FIFO queue. It took **2 minutes**. That's ~7.7 messages/second — painful for a latency-sensitive flow where delays directly affect user experience.
+
+After investigating the bottleneck, I shipped two targeted changes. The result: **2 seconds**. Same queue, same infrastructure, 60x throughput.
+
+## What I Found
+
+Profiling the pipeline, I traced the slowness to our messaging library: it was calling the SQS API once per message. For FIFO queues without content-based deduplication enabled, each call also required a `MessageDeduplicationId` — and the library was handling that inconsistently, which forced it down a slower, more conservative path.
+
+The fix came down to two things:
+
+1. Explicit, deterministic deduplication IDs
+2. Batch sends instead of one call per message
+
+## Optimization 1: Deterministic Deduplication IDs
+
+For FIFO queues, if you control the `MessageDeduplicationId` yourself, you get idempotency guarantees and can turn off content-based deduplication on the queue side (which has latency costs). I implemented the ID generation as a SHA-256 hash of the message content:
+
+```go title="dedup.go"
+package sqs
+
+import (
+    "crypto/sha256"
+    "encoding/hex"
+    "encoding/json"
+)
+
+// GenerateDeduplicationID returns a stable, content-derived dedup ID.
+// json.Marshal output is deterministic for structs with exported fields.
+func GenerateDeduplicationID(msg any) (string, error) {
+    b, err := json.Marshal(msg)
+    if err != nil {
+        return "", err
+    }
+    h := sha256.Sum256(b)
+    return hex.EncodeToString(h[:]), nil
+}
+```
+
+A few things worth noting here:
+
+- `json.Marshal` on a struct with exported fields is deterministic. On maps it is not — if your message is a `map[string]any`, sort the keys before marshaling or use a deterministic encoder.
+- The hash changes if any field value changes, which is exactly the behavior you want: same content → same ID → deduplicated by SQS.
+
+## Optimization 2: Batch Sending
+
+SQS allows up to 10 messages per `SendMessageBatch` call. I grouped messages into batches of 10 before sending, which reduced 924 HTTP round-trips down to 93 — a 90% drop in API calls.
+
+```go title="batch_sender.go"
+package sqs
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "strconv"
+
+    "github.com/aws/aws-sdk-go-v2/aws"
+    "github.com/aws/aws-sdk-go-v2/service/sqs"
+    "github.com/aws/aws-sdk-go-v2/service/sqs/types"
+)
+
+const maxBatchSize = 10
+
+type BatchSender struct {
+    client   *sqs.Client
+    queueURL string
+}
+
+func (s *BatchSender) SendInBatches(
+    ctx context.Context,
+    messages []any,
+    groupID string,
+) error {
+    for i := 0; i < len(messages); i += maxBatchSize {
+        end := min(i+maxBatchSize, len(messages))
+        if err := s.sendBatch(ctx, messages[i:end], groupID); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
+func (s *BatchSender) sendBatch(
+    ctx context.Context,
+    batch []any,
+    groupID string,
+) error {
+    entries := make([]types.SendMessageBatchRequestEntry, 0, len(batch))
+
+    for idx, msg := range batch {
+        body, err := json.Marshal(msg)
+        if err != nil {
+            return fmt.Errorf("marshal message %d: %w", idx, err)
+        }
+        dedupID, err := GenerateDeduplicationID(msg)
+        if err != nil {
+            return fmt.Errorf("dedup ID for message %d: %w", idx, err)
+        }
+        entries = append(entries, types.SendMessageBatchRequestEntry{
+            Id:                     aws.String(strconv.Itoa(idx)),
+            MessageBody:            aws.String(string(body)),
+            MessageDeduplicationId: aws.String(dedupID),
+            MessageGroupId:         aws.String(groupID),
+        })
+    }
+
+    result, err := s.client.SendMessageBatch(ctx, &sqs.SendMessageBatchInput{
+        QueueUrl: aws.String(s.queueURL),
+        Entries:  entries,
+    })
+    if err != nil {
+        return fmt.Errorf("SendMessageBatch: %w", err)
+    }
+
+    if len(result.Failed) > 0 {
+        // In production: retry failed entries with exponential backoff.
+        // Failed.SenderFault == false means the error is on AWS's side — retriable.
+        return fmt.Errorf("%d messages failed in batch", len(result.Failed))
+    }
+
+    return nil
+}
+```
+
+## Results
+
+| Metric | Before | After |
+|---|---|---|
+| Total time (924 msgs) | 120 s | 2 s |
+| Throughput | 7.7 msgs/s | 462 msgs/s |
+| Time per message | ~130 ms | ~2.2 ms |
+| SQS API calls | 924 | 93 |
+| Cost reduction (API calls) | — | ~90% |
+
+**60x improvement. 98.3% less time. ~90% fewer API calls.**
+
+## Going Further: Concurrent Batches
+
+If ordering within a `MessageGroupId` doesn't matter, you can dispatch multiple batches in parallel using a semaphore to cap concurrency:
+
+```go title="concurrent_sender.go"
+func (s *BatchSender) SendInBatchesConcurrent(
+    ctx context.Context,
+    messages []any,
+    groupID string,
+    concurrency int,
+) error {
+    batches := chunk(messages, maxBatchSize)
+
+    sem := make(chan struct{}, concurrency)
+    errc := make(chan error, len(batches))
+
+    var wg sync.WaitGroup
+    for _, b := range batches {
+        wg.Add(1)
+        sem <- struct{}{}
+        go func(batch []any) {
+            defer wg.Done()
+            defer func() { <-sem }()
+            if err := s.sendBatch(ctx, batch, groupID); err != nil {
+                errc <- err
+            }
+        }(b)
+    }
+
+    wg.Wait()
+    close(errc)
+
+    for err := range errc {
+        if err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+Note: concurrent sends across different `MessageGroupId` values are safe. Concurrent sends within the same `MessageGroupId` break FIFO ordering — only do this if you truly don't need ordering within the group.
+
+## SQS Batch Limits to Keep in Mind
+
+- Max 10 messages per `SendMessageBatch` call
+- Max 256 KB total payload per batch
+- Each individual message can be up to 256 KB
+- Partial failures are normal — check `result.Failed` and retry with backoff
+
+## Key Takeaways
+
+The 90% reduction in API calls is what drives the speedup — not any clever algorithm. When I profiled the pipeline, the problem was obvious in retrospect: we were making one network round-trip per message, and network latency compounds. Most messaging bottlenecks I've investigated aren't throughput problems — they're latency-per-call problems that batching fixes for free.
+
+If your pipeline is hitting SQS one message at a time, batch sends are the first thing to reach for. The code is straightforward, the AWS SDK supports it natively, and the gains — as I found here — can be dramatic.

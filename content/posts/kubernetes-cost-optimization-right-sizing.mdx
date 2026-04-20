@@ -1,0 +1,328 @@
+---
+title: "Kubernetes Cost Optimization: Right-Sizing with P95/P99 Metrics"
+description: "How to cut cluster costs by 40–70% by replacing guessed resource configs with metric-driven right-sizing — without sacrificing reliability."
+date: "2026-04-20"
+tags: ["kubernetes", "cost-optimization", "platform-engineering", "devops"]
+---
+
+The average Kubernetes cluster runs at 10–20% utilization. The resources you provisioned but aren't using still appear on your cloud bill. For a medium-sized cluster that's often $100k+ per year in waste.
+
+The fix isn't to buy less upfront and hope. It's to measure what your workloads actually consume, then set requests and limits that reflect reality — with just enough headroom to stay reliable. This is right-sizing, and it's the highest-ROI infrastructure optimization I've seen in practice.
+
+## Why Over-Provisioning Happens
+
+The common anti-patterns:
+
+- Setting generous requests "to be safe" without ever revisiting them
+- Copying resource specs from a similar service without measuring
+- Using the same config across dev, staging, and production
+- Setting limits without understanding the actual consumption distribution
+
+The result: pods scheduled to nodes with large reservations they never use, cluster utilization stays low, you keep adding nodes, costs compound.
+
+## Requests vs. Limits — What Each One Actually Does
+
+Before touching any numbers, get this model clear:
+
+**Requests** are what the scheduler uses to place the pod on a node. The node reserves exactly this amount. Requests are the basis for HPA and VPA decisions.
+
+**Limits** are the hard cap. For CPU: the container is throttled when it hits the limit. For memory: it's OOMKilled.
+
+```yaml
+resources:
+  requests:
+    cpu: "100m"     # scheduler uses this to pick a node
+    memory: "128Mi"
+  limits:
+    cpu: "300m"     # throttled if exceeded
+    memory: "256Mi" # OOMKilled if exceeded
+```
+
+The QoS class your pod gets depends on how you set these:
+
+| QoS Class | Requests | Limits | Eviction Priority |
+|---|---|---|---|
+| Guaranteed | Set | Equal to requests | Last evicted |
+| Burstable | Set | Greater than requests | Middle |
+| BestEffort | Not set | Not set | First evicted |
+
+For production workloads: Guaranteed or Burstable. BestEffort for batch jobs where eviction is acceptable.
+
+## The Right-Sizing Formula
+
+Don't guess. Collect 7–14 days of real traffic data, then apply these rules:
+
+| Resource | Request | Limit | Rationale |
+|---|---|---|---|
+| CPU | P50 + 20% | P95 + 30% | Requests cover median; limits handle spikes |
+| Memory | P95 + 10% | P99 + 20% | Memory can't be throttled — OOM margin matters |
+| Batch jobs | P99 + 10% | P99 + 20% | Predictable load, size conservatively |
+| Databases | P95 + 50% | P99 + 100% | Critical — give extra headroom |
+
+## Getting the Metrics
+
+Start with Prometheus. These queries give you the percentile distribution you need:
+
+```promql
+# CPU usage percentiles (7-day window)
+histogram_quantile(0.50, rate(container_cpu_usage_seconds_total[7d]))
+histogram_quantile(0.95, rate(container_cpu_usage_seconds_total[7d]))
+histogram_quantile(0.99, rate(container_cpu_usage_seconds_total[7d]))
+
+# CPU throttling — if this is high, your limits are too low
+rate(container_cpu_cfs_throttled_seconds_total[5m]) /
+rate(container_cpu_cfs_periods_total[5m]) * 100
+
+# Memory usage percentiles
+histogram_quantile(0.95, rate(container_memory_working_set_bytes[7d]))
+histogram_quantile(0.99, rate(container_memory_working_set_bytes[7d]))
+
+# OOMKill events — if this is non-zero, your limits are too low
+increase(container_oom_kills_total[1h])
+```
+
+Two signals to watch for before you start cutting:
+- **High throttling rate (>10%)**: current CPU limits are already too low. Fix this before optimizing down.
+- **OOMKill events**: current memory limits are too low. Same — fix before cutting.
+
+Finding over-provisioned pods:
+
+```promql
+# Pods where CPU usage is < 20% of their request
+(
+  rate(container_cpu_usage_seconds_total[5m]) /
+  (container_spec_cpu_quota / container_spec_cpu_period)
+) * 100 < 20
+
+# Pods where memory usage is < 30% of their limit
+(
+  container_memory_working_set_bytes /
+  container_spec_memory_limit_bytes
+) * 100 < 30
+```
+
+## Roll Out Gradually
+
+Don't touch production first. Phase it:
+
+**Week 1–2:** Collect baseline metrics. Install Prometheus + Grafana if you don't have them:
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm install prometheus prometheus-community/kube-prometheus-stack
+kubectl top nodes && kubectl top pods --all-namespaces
+```
+
+**Week 3:** Non-critical workloads and dev environments. Dev is often the biggest quick win — 90% waste is common.
+
+```yaml
+# Dev: aggressive cuts are safe
+resources:
+  requests:
+    cpu: "50m"
+    memory: "64Mi"
+  limits:
+    cpu: "200m"
+    memory: "128Mi"
+```
+
+**Week 4:** Staging, using P95/P99 values.
+
+**Weeks 5–6:** Production, with a conservative 25–50% safety buffer added on top of the formula values.
+
+After each wave: check OOMKills, CPU throttling, and pod restart counts before proceeding.
+
+```bash
+# Post-change monitoring
+kubectl get events --field-selector reason=OOMKilling --all-namespaces
+kubectl get pods --all-namespaces -o custom-columns=\
+  NAMESPACE:.metadata.namespace,\
+  NAME:.metadata.name,\
+  RESTARTS:.status.containerStatuses[*].restartCount
+```
+
+## Automate with VPA
+
+Once you've done the manual right-sizing pass, use Vertical Pod Autoscaler to maintain it:
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: my-app-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  updatePolicy:
+    updateMode: "Off"   # Start with Off to get recommendations without auto-applying
+  resourcePolicy:
+    containerPolicies:
+    - containerName: app
+      minAllowed:
+        cpu: 50m
+        memory: 64Mi
+      maxAllowed:
+        cpu: 1
+        memory: 1Gi
+      controlledResources: ["cpu", "memory"]
+```
+
+Start with `updateMode: "Off"` — VPA will write its recommendations to the object status so you can review them before they're applied. Move to `"Auto"` once you trust the recommendations.
+
+Pair VPA (vertical) with HPA (horizontal) for workloads with variable traffic:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 5 min cooldown before scaling down
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+```
+
+## Set Guardrails with Resource Quotas
+
+Prevent new services from over-provisioning by default with namespace-level guardrails:
+
+```yaml
+# Cap total resource consumption per namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: compute-quota
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "20"
+
+---
+# Give containers sensible defaults when nothing is specified
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+spec:
+  limits:
+  - default:
+      cpu: "200m"
+      memory: "256Mi"
+    defaultRequest:
+      cpu: "100m"
+      memory: "128Mi"
+    type: Container
+```
+
+The `LimitRange` is particularly important: without it, a container with no resource spec gets `BestEffort` QoS and becomes the first candidate for eviction under pressure.
+
+## Alerting on Waste and Risk
+
+Add these Prometheus recording rules and alerts. The waste ratio alerts catch over-provisioning proactively; the OOMKill and throttling alerts catch when you've cut too far:
+
+```yaml
+groups:
+- name: cost-optimization
+  rules:
+  - record: kubernetes:pod_cpu_waste_ratio
+    expr: |
+      (
+        (container_spec_cpu_quota / container_spec_cpu_period) -
+        rate(container_cpu_usage_seconds_total[5m])
+      ) / (container_spec_cpu_quota / container_spec_cpu_period)
+
+  - record: kubernetes:pod_memory_waste_ratio
+    expr: |
+      (
+        container_spec_memory_limit_bytes -
+        container_memory_working_set_bytes
+      ) / container_spec_memory_limit_bytes
+
+- name: cost-alerts
+  rules:
+  - alert: HighResourceWaste
+    expr: kubernetes:pod_cpu_waste_ratio > 0.7
+    for: 1h
+    labels:
+      severity: warning
+    annotations:
+      summary: "{{ $labels.pod }} is wasting >70% of CPU allocation"
+
+  - alert: FrequentOOMKills
+    expr: increase(container_oom_kills_total[1h]) > 3
+    for: 0m
+    labels:
+      severity: critical
+    annotations:
+      summary: "{{ $labels.pod }} has frequent OOM kills — increase memory limit"
+
+  - alert: ExcessiveCPUThrottling
+    expr: |
+      (
+        rate(container_cpu_cfs_throttled_seconds_total[5m]) /
+        rate(container_cpu_cfs_periods_total[5m])
+      ) * 100 > 25
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "{{ $labels.pod }} throttled >25% — increase CPU limit"
+```
+
+## Real-World Results
+
+A case study from an e-commerce microservices platform:
+
+| | Before | After |
+|---|---|---|
+| Cluster | 50 nodes (16 vCPU / 32 GB) | 30 nodes (8 vCPU / 16 GB) |
+| Monthly cost | $12,000 | $4,800 |
+| Avg utilization | 15% | 65% |
+| Resource waste | 70% | 15% |
+
+CPU changes per workload type:
+
+| Workload | Before | After | Reduction |
+|---|---|---|---|
+| Web frontend | 1000m | 200m | 80% |
+| API gateway | 2000m | 500m | 75% |
+| Database | 4000m | 2000m | 50% |
+| Background jobs | 500m | 100m | 80% |
+
+Key learnings from that engagement:
+- P95-based requests gave optimal scheduling without padding
+- P99-based limits handled traffic spikes without throttling
+- Memory right-sizing had higher ROI than CPU in this workload mix
+- Dev environments had ~90% waste and were the fastest wins
+
+---
+
+The goal isn't to minimize resource allocations — it's to match allocations to actual consumption. Too low and you get OOMKills and throttling; too high and you pay for nothing. Measure first, then cut. P95/P99 metrics give you the data to do it without guessing.

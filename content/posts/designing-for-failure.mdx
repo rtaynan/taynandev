@@ -1,0 +1,56 @@
+---
+title: "Designing for failure: the question I ask every PR"
+description: "One question that will surface more production risk than any checklist: what happens when this fails?"
+date: "2026-03-14"
+tags: ["distributed-systems", "reliability", "engineering"]
+featured: true
+---
+
+The single most valuable habit I've built over the last decade is asking one
+question, on every non-trivial change I review or write:
+
+> **What happens when this fails?**
+
+Not *if*. **When.** Every line of code you add is a new way for the system to
+fail, and the failure is never the part you were looking at when you wrote it.
+
+## A concrete example
+
+Consider a handler that enriches an event with data from a downstream service:
+
+```ts
+async function enrichEvent(event: Event): Promise<EnrichedEvent> {
+  const user = await userService.getById(event.userId);
+  return { ...event, user };
+}
+```
+
+This is the kind of code that looks fine, passes review, ships — and then one
+Tuesday at 3am, `userService` has a p99 of 12 seconds and your whole pipeline
+is wedged because nobody set a timeout.
+
+Ask *what happens when this fails* and you immediately see the questions you
+forgot to answer:
+
+- What's the timeout? (Not "the default" — what's the *number*?)
+- What do we do if the user isn't found? Drop the event? Dead-letter it?
+- Is this service call retriable, and if so, is the downstream idempotent?
+- Does this handler have a circuit breaker, or will we cascade?
+
+## The cheap fix
+
+I'm not going to tell you to add all of those in every handler. The point of
+the question is not to write more code — it's to make the tradeoffs **visible**
+in the PR, so that "we decided not to handle that" is a conscious decision
+rather than an accident.
+
+Most failures in production aren't from hard problems. They're from easy
+problems nobody bothered to look at.
+
+## What to do with it
+
+Put the question on your PR template. Ask it in design reviews. Ask it of
+yourself before you open the PR. You'll ship fewer outages and — this is the
+part that surprised me — you'll write less code, because the moment you see the
+failure modes, a lot of the "robustness" you were planning turns out to be
+unnecessary.
