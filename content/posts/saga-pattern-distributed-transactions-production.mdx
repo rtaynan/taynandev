@@ -1,6 +1,6 @@
 ---
 title: "Distributed Transactions Without Two-Phase Commit: The Saga Pattern in Production"
-description: "Two-phase commit doesn't scale. Here's how I handle consistency across microservices in production using the Saga pattern — with real failure modes, idempotency requirements, and SQS-backed choreography."
+description: "How to keep payment and order flows consistent across microservices at scale — with real failure modes, idempotency requirements, and SQS-backed orchestration that degrades gracefully instead of deadlocking."
 date: "2026-04-20"
 tags: ["distributed-systems", "architecture", "aws", "sqs", "golang"]
 featured: false
@@ -253,3 +253,13 @@ The overhead is real: more code, more infrastructure, more failure modes to hand
 ---
 
 Two-phase commit is elegant on paper. In production, at scale, with network partitions and partial failures, it becomes the thing that takes your whole system down when one service is slow. Sagas trade that elegance for resilience — and resilience is the one you want at 3am.
+
+---
+
+## Why This Matters Beyond One Company
+
+Operational resilience in financial services and commerce is no longer just an engineering concern — it is a regulatory one. The Office of the Comptroller of the Currency (OCC), the Federal Reserve, and the FDIC have all issued guidance on operational resilience for financial institutions, with explicit expectations around the ability of systems to absorb and recover from disruptions without data loss or inconsistent state. The pattern documented here — Saga orchestration with durable state, idempotent handlers, and explicit compensation — is the engineering implementation of what those frameworks require.
+
+Beyond regulated industries, the same problem affects every multi-service architecture processing financial transactions, inventory reservations, or any workflow where partial completion leaves the system in an inconsistent state. The naive approach (sequential service calls with manual cleanup) is the implementation most teams ship first — and the source of the silent data inconsistencies they discover months later. The Saga pattern with proper idempotency and compensation is the correct architecture, and making it concrete and reproducible is the point of this article.
+
+The complete implementation — saga state machine, SQS orchestration, DynamoDB-backed deduplication, and compensation logic — is designed to be adapted, not just read. If it prevents one team from shipping the sequential-calls anti-pattern into a payment flow, the investment in documenting it has paid off.

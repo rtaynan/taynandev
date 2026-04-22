@@ -285,3 +285,13 @@ If you're starting from scratch, prioritize in this order:
 You don't need expensive tooling to get started. `log/slog` + OpenTelemetry + Prometheus covers most of this and runs on any infrastructure.
 
 The goal isn't perfect observability — it's being able to answer *what, where, and why* fast enough that the person on call can make progress alone, at any hour, without needing to wake up anyone else.
+
+---
+
+## Why This Matters Beyond One Company
+
+Observability has crossed from engineering best practice into national policy. Executive Order 14028 ("Improving the Nation's Cybersecurity"), signed in 2021, mandates that federal agencies and their software suppliers implement comprehensive logging and monitoring — specifically calling out the need for structured event logs, audit trails, and the ability to reconstruct system state after an incident. The NIST SP 800-92 and SP 800-137 publications provide the technical baseline; EO 14028 made compliance with that baseline a requirement for any organization in the federal software supply chain.
+
+Beyond the federal context, the impact of poor observability is measured in incident duration and blast radius. An engineering team that can answer "what, where, and why" in under ten minutes contains incidents before they cascade. A team working from unstructured logs and average-latency dashboards spends 45 minutes on the same diagnosis — and in financial services, healthcare, or logistics, those 35 minutes have a direct cost in user impact and regulatory exposure.
+
+The setup documented here — structured logging with context propagation, OpenTelemetry-based distributed tracing, business-level Prometheus metrics, and actionable alerting — runs on open-source tooling available to any engineering organization, regardless of cloud provider or budget. The implementation is complete and directly deployable. The goal in publishing it is to raise the floor: every production distributed system should be debuggable by design, not retrofitted after the first major incident.

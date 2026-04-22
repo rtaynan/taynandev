@@ -450,3 +450,13 @@ The question — *what happens when this fails?* — gives you the frame. The pa
 And k6 gives you the proof. A resilience design that hasn't been tested under failure conditions is a hypothesis, not a guarantee. Fault injection tests are how you turn "I think this will hold" into "I've seen it hold."
 
 Put the question on your PR template. Wire the patterns where the answers demand them. And before you ship, break it on purpose — it's the only way to know it won't break on its own.
+
+---
+
+## Why This Matters Beyond One Company
+
+Resilience engineering is not a nice-to-have for individual companies — it is a documented national priority. CISA's Critical Infrastructure Security and Resilience framework identifies the operational continuity of digital systems as foundational to US economic stability and public safety. Executive Order 14028 ("Improving the Nation's Cybersecurity") mandates resilience practices — including fallback mechanisms, fault isolation, and incident response readiness — across federal systems and their software supply chains.
+
+But the impact of poor resilience design is not limited to government systems. Every major US digital sector — financial services, healthcare technology, e-commerce, logistics — runs on distributed backends where a single missing timeout or absent circuit breaker can cascade into an outage affecting millions of users. The 2021 Facebook outage, the 2022 AWS us-east-1 incidents, and dozens of smaller failures that never make the news all trace back to the same root: a system that was never asked "what happens when this fails?"
+
+The patterns in this article — timeouts, retry with jitter, circuit breakers, bulkheads, and fault-injection load testing — are not research concepts. They are production-proven implementations, each with complete code and a k6 test harness designed to verify the behavior under real load. Making them reproducible and teachable is how resilience knowledge moves from the teams that discovered it the hard way to the teams that haven't been hit yet.
