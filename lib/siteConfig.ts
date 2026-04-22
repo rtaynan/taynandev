@@ -2,7 +2,7 @@ export const siteConfig = {
   name: "Taynan Rezende",
   title: "Taynan Rezende — Software Engineer",
   description:
-    "Senior software engineer writing about distributed systems, clean architecture, developer experience, and practical engineering.",
+    "Senior software engineer specializing in distributed systems, cloud cost optimization, and operational observability. Writing about backend engineering at scale.",
   url:
     process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ||
     "https://taynan.dev",
@@ -11,31 +11,31 @@ export const siteConfig = {
     name: "Taynan Rezende",
     email: "taynan.rezende@gmail.com",
     role: "Senior Software Engineer",
-    bio: "I build reliable software and write about the craft. I care about systems that are simple to reason about, a pleasure to operate, and fast enough that nobody has to think about performance.",
+    bio: "Ten years building backend systems at scale — distributed event pipelines, cloud cost optimization, and operational observability for platforms serving millions of users. I write about the failure modes I've shipped around and the patterns that held up under real traffic.",
     location: "Brazil",
     yearsOfExperience: 10,
   },
 
-  // Companies you've worked at — shown as a subtle proof strip under the hero.
-  // Order matters (most relevant first). Keep to 3–6 entries.
+  // Companies you've worked at — shown as a proof strip under the hero.
+  // Order: most recent / most relevant first.
   companies: [
     { name: "iFood", url: "https://institucional.ifood.com.br/sobre/" },
     { name: "Coinbase", url: "https://www.coinbase.com/" },
+    { name: "OOBJ (acq. by Avalara)", url: "https://www.avalara.com/us/en/index.html" },
     { name: "TOTVS", url: "https://www.totvs.com/" },
   ],
 
-  // One-line impact statements recruiters / clients can scan in 2 seconds.
-  // Aim for concrete numbers. Keep to 2–4 bullets.
+  // One-line impact statements — concrete, metric-driven, company-attached.
   impact: [
-    "Shipped distributed systems handling 100M+ events/day.",
-    "Led backend architecture for products serving 5M+ users.",
-    "Built developer platforms that cut deploy time from hours to minutes.",
+    "Reduced DynamoDB spend 91% ($218k/year) redesigning the data model for a 45B-write/month auction pipeline — no infrastructure migration.",
+    "Increased campaign messaging throughput 60× (120 s → 2 s) by optimizing AWS SQS FIFO batching in Go.",
+    "Migrated a decade of SVN history to Git and rebuilt the CI/CD pipeline, cutting customer release time from a full working day to a few hours.",
   ],
 
   // "What I'm currently doing" — update this every few weeks. Keeps the site
   // feeling alive and gives visitors a reason to come back.
   now: {
-    updatedAt: "2026-04-20",
+    updatedAt: "2026-04-22",
     items: [
       "Writing about distributed systems tradeoffs I keep seeing in production.",
       "Exploring deterministic simulation testing for backend services.",

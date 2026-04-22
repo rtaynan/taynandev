@@ -9,17 +9,25 @@ export function CompanyStrip() {
       <p className="text-xs font-medium uppercase tracking-wider text-slate-500 dark:text-slate-400">
         Previously
       </p>
-      <ul className="flex flex-wrap items-center gap-x-6 gap-y-2">
-        {siteConfig.companies.map((company) => (
-          <li key={company.name}>
-            <Link
-              href={company.url}
-              className="text-sm font-medium text-slate-700 transition hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100"
-            >
-              {company.name}
-            </Link>
-          </li>
-        ))}
+      <ul className="flex flex-wrap items-center gap-x-6 gap-y-3">
+        {siteConfig.companies.map((company) => {
+          const role = "role" in company ? (company as { role: string }).role : null;
+          const period = "period" in company ? (company as { period: string }).period : null;
+          return (
+            <li key={company.name}>
+              <Link href={company.url} className="group flex flex-col transition">
+                <span className="text-sm font-medium text-slate-700 transition group-hover:text-slate-900 dark:text-slate-300 dark:group-hover:text-slate-100">
+                  {company.name}
+                </span>
+                {role && period && (
+                  <span className="text-xs text-slate-400 dark:text-slate-500">
+                    {role} · {period}
+                  </span>
+                )}
+              </Link>
+            </li>
+          );
+        })}
       </ul>
     </div>
   );

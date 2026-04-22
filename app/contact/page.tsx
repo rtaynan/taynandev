@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Mail, Phone, Linkedin, Github } from "lucide-react";
-import { NewsletterForm } from "@/components/NewsletterForm";
+// import { NewsletterForm } from "@/components/NewsletterForm";
 import { siteConfig } from "@/lib/siteConfig";
 
 export const metadata: Metadata = {
@@ -81,19 +81,19 @@ export default function ContactPage() {
       </section>
       */}
 
-      {/* Newsletter */}
+      {/* Newsletter — disabled until provider is wired up
       <section className="mt-16 rounded-xl border border-slate-200 bg-slate-50 p-8 dark:border-slate-800 dark:bg-slate-900/50">
         <h2 className="text-xl font-semibold tracking-tight text-slate-900 dark:text-slate-100">
           Prefer the newsletter?
         </h2>
         <p className="mt-2 text-slate-600 dark:text-slate-400">
-          No pitches, no tracking pixels — just new writing when it&apos;s
-          ready.
+          No pitches, no tracking pixels — just new writing when it&apos;s ready.
         </p>
         <div className="mt-6">
           <NewsletterForm />
         </div>
       </section>
+      */}
     </div>
   );
 }

@@ -5,7 +5,7 @@ import { ArticleCard } from "@/components/ArticleCard";
 import { FeaturedArticleCard } from "@/components/FeaturedArticleCard";
 import { CompanyStrip } from "@/components/CompanyStrip";
 import { NowBlock } from "@/components/NowBlock";
-import { NewsletterForm } from "@/components/NewsletterForm";
+// import { NewsletterForm } from "@/components/NewsletterForm";
 import { siteConfig } from "@/lib/siteConfig";
 
 export default function HomePage() {
@@ -23,8 +23,9 @@ export default function HomePage() {
           {siteConfig.author.role} · {siteConfig.author.yearsOfExperience}+ years
         </p>
         <h1 className="text-4xl font-bold tracking-tight text-slate-900 sm:text-5xl dark:text-slate-100">
-          Hi, I&apos;m {siteConfig.author.name.split(" ")[0]}. I build software
-          that holds up in production — and I write about how.
+          Hi, I&apos;m {siteConfig.author.name.split(" ")[0]}. I build
+          distributed systems at scale — and write about the failure modes that
+          don&apos;t make it into the docs.
         </h1>
         <p className="max-w-2xl text-lg text-slate-600 dark:text-slate-400">
           {siteConfig.author.bio}
@@ -116,7 +117,7 @@ export default function HomePage() {
         </div>
       </section>
 
-      {/* Newsletter */}
+      {/* Newsletter — disabled until provider is wired up
       <section className="mt-20 rounded-xl border border-slate-200 bg-slate-50 p-8 dark:border-slate-800 dark:bg-slate-900/50">
         <h2 className="text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100">
           Get new writing in your inbox
@@ -129,6 +130,7 @@ export default function HomePage() {
           <NewsletterForm />
         </div>
       </section>
+      */}
     </div>
   );
 }

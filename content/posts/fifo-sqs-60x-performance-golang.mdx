@@ -197,3 +197,13 @@ Note: concurrent sends across different `MessageGroupId` values are safe. Concur
 The 90% reduction in API calls is what drives the speedup — not any clever algorithm. When I profiled the pipeline, the problem was obvious in retrospect: we were making one network round-trip per message, and network latency compounds. Most messaging bottlenecks I've investigated aren't throughput problems — they're latency-per-call problems that batching fixes for free.
 
 If your pipeline is hitting SQS one message at a time, batch sends are the first thing to reach for. The code is straightforward, the AWS SDK supports it natively, and the gains — as I found here — can be dramatic.
+
+---
+
+## Why This Matters Beyond One Company
+
+Messaging latency is a hidden tax on every event-driven architecture. In the US, the majority of cloud-native applications — across fintech, e-commerce, healthcare technology, and logistics — rely on AWS SQS or equivalent message queues as the backbone of their operational pipelines. When those pipelines run inefficiently, the cost is paid in two currencies: engineering time spent debugging throughput bottlenecks, and direct AWS spend on API calls that could be batched for free.
+
+The two changes documented here — deterministic deduplication IDs and `SendMessageBatch` grouping — are not optimizations that require deep infrastructure access or specialized tooling. They are available to any Go (or any-language) team using the standard AWS SDK today. The implementation reduces API calls by 90%, cuts pipeline latency by 98%, and does so without touching queue configuration, IAM policies, or service topology.
+
+For organizations running campaign, notification, or event-processing workloads at scale, applying this pattern has a direct impact on both operational cost and user-facing latency — two areas where the gap between what's possible and what most teams are doing remains large. Publishing this case and the complete implementation is an attempt to close that gap.

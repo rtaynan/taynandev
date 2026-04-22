@@ -326,3 +326,13 @@ Key learnings from that engagement:
 ---
 
 The goal isn't to minimize resource allocations — it's to match allocations to actual consumption. Too low and you get OOMKills and throttling; too high and you pay for nothing. Measure first, then cut. P95/P99 metrics give you the data to do it without guessing.
+
+---
+
+## Why This Matters Beyond One Company
+
+Kubernetes cluster waste is a systemic problem across the US technology sector. The average cluster runs at 10–20% utilization — meaning organizations are paying for four to ten times the compute they actually use. At enterprise scale, this translates to millions of dollars per year in cloud spend with no corresponding business value. The US government's own cloud spending reports (OMB and GAO) have consistently identified resource overprovisioning as one of the top drivers of federal IT inefficiency; the same dynamic plays out across every industry running containerized workloads.
+
+The right-sizing methodology documented here — P95/P99 metric collection, phased rollout from dev to production, VPA automation, and waste-ratio alerting — is not organization-specific. It is directly applicable to any Kubernetes workload, regardless of cloud provider, industry, or cluster size. The case study in this article achieved a 60% cost reduction ($7,200/month saved) on a mid-sized microservices platform; at the scale of US enterprise Kubernetes adoption, the aggregate recoverable waste from this class of optimization runs into the billions annually.
+
+This is the kind of engineering work that compounds beyond the team that does it first: documented, reproducible, and immediately applicable by any platform or DevOps engineer reading this today.
