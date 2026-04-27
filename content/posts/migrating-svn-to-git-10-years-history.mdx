@@ -1,13 +1,13 @@
 ---
-title: "Migrating 10 Years of SVN History to Git — and Cutting Release Time from Days to Hours"
-description: "How I migrated a decade-old Subversion repository to Git without losing a single commit, unlocking a pipeline rewrite that took customer releases from more than a day to a few hours."
+title: "Migrating 10 Years of SVN History to Git — and Cutting Release Time from a Full Day to ~1 Hour"
+description: "How I migrated a decade-old Subversion repository to Git without losing a single commit, unlocking a pipeline rewrite that took customer releases from more than a day to ~1 hour — 87% faster."
 date: "2019-12-06"
 tags: ["git", "svn", "migration", "ci-cd", "devops"]
 ---
 
 Legacy version control debt compounds silently. At OOBJ (later acquired by Avalara), a decade of Subversion commits, hundreds of contributors, a repository that had outgrown its tooling — and a release pipeline so slow and fragile that shipping a new version to customers required a full working day of engineers on standby. The bottleneck wasn't writing code. It was delivering it.
 
-This is the story of how I migrated that repository to Git without losing a single commit, and the CI/CD pipeline rewrite it enabled — which took our release cycle from **more than a full working day** to **a handful of hours**, freed ~400–600 engineer-hours per year, and permanently removed the release-babysitting tax from the team's plate.
+This is the story of how I migrated that repository to Git without losing a single commit, and the CI/CD pipeline rewrite it enabled — which took our release cycle from **more than a full working day** to **~1 hour** — an 87% reduction, freed ~400–600 engineer-hours per year, and permanently removed the release-babysitting tax from the team's plate.
 
 ## The Release Pipeline That Ate a Day
 
@@ -138,7 +138,7 @@ git push
 
 I ran this sync on a schedule during the two-week overlap window. Once the last SVN commit was mirrored and Jenkins was fully cut over to Git, we froze SVN writes and the migration was done.
 
-## The Payoff: Days to Hours
+## The Payoff: A Full Day to ~1 Hour
 
 The migration itself was just the enabler. The real win came from what we could now do with Jenkins.
 
@@ -146,7 +146,7 @@ With the repository on Git — and hosted on Bitbucket — I rewrote our Jenkins
 
 | | Before (SVN) | After (Git + Bitbucket + new Jenkins) |
 |---|---|---|
-| Average release time to customers | **> 1 working day** | **a few hours** |
+| Average release time to customers | **> 1 working day** | **~1 hour** |
 | Engineers required during release | Multiple, on standby | Triggered and monitored by one engineer |
 | Pipeline failures | Common; required full restart from scratch | Rare; automated retries on transient failures |
 | Feature/fix delivery cadence | Gated by the release bottleneck | Gated by engineering, not by the pipeline |
@@ -166,10 +166,10 @@ Running the numbers with conservative assumptions:
 | | Before | After |
 |---|---|---|
 | Engineers tied up per release | ~3 | 1 |
-| Duration per release | ~8 hours (full day) | ~2 hours |
-| Engineer-hours per release | **~24** | **~2** |
+| Duration per release | ~8 hours (full day) | ~1 hour |
+| Engineer-hours per release | **~24** | **~1** |
 
-That's roughly **22 engineer-hours saved per release**. At the team's release cadence, it compounded to somewhere in the range of **400–600 engineer-hours per year reclaimed** — about three months of full-time engineering capacity that used to evaporate into release babysitting and now went into shipping features and fixes instead.
+That's roughly **23 engineer-hours saved per release**. At the team's release cadence, it compounded to somewhere in the range of **400–600 engineer-hours per year reclaimed** — about three months of full-time engineering capacity that used to evaporate into release babysitting and now went into shipping features and fixes instead.
 
 And that's before counting the **context-switch tax**. Engineers who knew they were on release duty couldn't start deep work that day — they had to stay available for the inevitable failure. That cost doesn't appear on any timesheet, but anyone who's done on-call knows how real it is.
 
@@ -193,7 +193,7 @@ Engineer hours back in the build queue. Infrastructure no longer on the cloud bi
 A few things stuck with me from this project:
 
 - **Preserving history pays off forever.** The migration cost two extra weeks of work to do it right. Every `git blame` since has paid that back.
-- **The migration wasn't the win — the rewrite it enabled was.** If we'd migrated to Git and kept the same pipeline shape, we would have gotten maybe a 20% improvement. The "days to hours" jump came from restructuring the pipeline around Git's primitives (cheap branches, fast operations, clean merges).
+- **The migration wasn't the win — the rewrite it enabled was.** If we'd migrated to Git and kept the same pipeline shape, we would have gotten maybe a 20% improvement. The "full day to ~1 hour" jump came from restructuring the pipeline around Git's primitives (cheap branches, fast operations, clean merges).
 - **Gradual cutover beats big-bang.** Running SVN and Git in parallel for two weeks, with `git svn fetch` + `sync-rebase` keeping them in sync, meant we could validate the new pipeline on real traffic before burning the bridge.
 - **Tooling pain compounds silently.** "We lose a day every release" sounds manageable until you multiply it by release frequency and the headcount involved. The ROI on fixing it was obvious in retrospect.
 
@@ -207,4 +207,4 @@ Legacy infrastructure modernization is one of the most persistent and costly pro
 
 The migration methodology in this article — full history preservation with `git svn`, author mapping, phased cutover with live sync, and pipeline rewrite — is a complete, battle-tested playbook for any organization still running SVN today. And despite two decades of industry momentum toward Git, a substantial portion of US enterprise engineering organizations (particularly in financial services, government contracting, and large ISVs) still operate on SVN or SVN-equivalent legacy VCS infrastructure.
 
-The ROI is not theoretical: ~22 engineer-hours saved per release, $8–15k/year in avoided infrastructure spend, and the compounding benefit of a development workflow that no longer penalizes teams for branching, merging, or shipping frequently. Documenting this end-to-end — not just "migrate to Git" but the full playbook for doing it without data loss and without a big-bang cutover — is the contribution this article makes to every team that comes after.
+The ROI is not theoretical: ~23 engineer-hours saved per release, $8–15k/year in avoided infrastructure spend, and the compounding benefit of a development workflow that no longer penalizes teams for branching, merging, or shipping frequently. Documenting this end-to-end — not just "migrate to Git" but the full playbook for doing it without data loss and without a big-bang cutover — is the contribution this article makes to every team that comes after.
