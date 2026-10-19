@@ -1,0 +1,305 @@
+---
+title: "Global Context for AI Agents: A Single Source of Truth Across Microservices"
+description: "An AI agent that opens one microservice only sees that microservice — and fills the gaps with fiction. Here's the pattern I use to give agents (and humans) a shared, cheap-to-load, validated map of the whole ecosystem."
+date: "2026-10-19"
+tags: ["ai", "ai-agents", "claude-code", "microservices", "architecture", "documentation"]
+featured: true
+---
+
+When you run dozens of microservices, knowledge about "how things work" ends up **scattered**:
+
+- Each repository documents (when it documents anything) only itself.
+- Nobody has a clear view of **how services relate** — who calls whom, which topics connect what, where the boundaries are.
+- Each team uses slightly different names for the same concepts ("order" vs "purchase" vs "checkout"), and that slowly erodes communication.
+- Code and architecture patterns get reinvented in every service.
+
+This problem gets **much worse with AI agents**. An agent that opens a single service only sees that service. It doesn't know:
+
+- that `pricing-api` receives data from `catalog-sync-worker`,
+- that stock reservations are owned by `inventory-reservation-worker`, not by the service it's looking at,
+- that "Price" and "Discount" are different things in your domain.
+
+Without a shared source, the agent **fills the gap with fiction**: it invents a service that doesn't exist, a topic nobody consumes, or a boundary that was never documented. That is the shortest path to **hallucination**.
+
+## The Solution: A Global Context Repository
+
+The idea is simple: **extract shared knowledge into a single repository**, and have both services and agents **reference** it — instead of copying its content.
+
+That repository (I'll call it `platform-context`) becomes the single source of truth for:
+
+- **the ecosystem** — a map plus one profile per service;
+- **the standards** — architecture, design, and style conventions;
+- **the domain language** — a glossary (ubiquitous language);
+- **the contracts** — the public surface that crosses service boundaries.
+
+The key idea: **it serves humans and AI agents equally**. The same text that onboards a new engineer guides Claude Code.
+
+The core premise is **anti-hallucination**: the agent checks the index before claiming a service or topic exists. **Not in the index = does not exist in the ecosystem**, until someone documents it.
+
+## Anatomy of the Repository
+
+```
+platform-context/
+├── ecosystem/          # the map and one profile per service
+│   ├── map.md          # index + diagrams + topics (kept LEAN)
+│   ├── _template.md    # template for a new service profile
+│   └── <slug>.md       # one profile per service
+├── standards/          # cross-team conventions
+│   ├── architecture.md # structure, Ports & Adapters, DI, shutdown
+│   ├── system-design.md# decomposition, consistency, resilience
+│   └── style-guide.md  # language, API, logging, observability, git
+├── contracts/          # GENERATED mirrors of published contracts
+│   ├── registry.yaml   # manifest (updated by CI)
+│   └── <slug>-v1.yaml  # readable mirror (DO NOT edit by hand)
+├── templates/          # artifacts services copy
+│   ├── trd.md          # Technical Requirements Document
+│   ├── plan.md         # implementation plan (FROZEN after merge)
+│   └── project-overview.md
+└── glossary.md         # domain language (ubiquitous language)
+```
+
+Each folder has a different **rate of change**, documented in the README, which makes it obvious where to touch for each kind of change.
+
+### `ecosystem/map.md` — The Consolidated View
+
+The map is the entry point. It contains exactly three things, and **nothing else**:
+
+1. **Flow diagrams** (Mermaid) — one per pipeline (checkout, catalog ingestion, payments, fulfillment, search indexing...);
+2. **Service index** — one line per service with its type and a link to its profile;
+3. **Topic table** — who publishes and who consumes each event topic.
+
+The rule is explicit: *the map only holds diagrams, the index, and topics. Never details.* Details live in the service profile. The map is the **anti-hallucination index** — it defines what actually exists.
+
+### `ecosystem/<slug>.md` — The Service Profile
+
+Each service gets a profile based on `_template.md`, with:
+
+- **Purpose** (one sentence), **owner**, **repo**, **entrypoint**;
+- **Relationships** — upstream (who calls us), downstream (who we call), and "consumed without depending on" (cache, fallback, async);
+- **Boundaries** — what it **does** and, just as important, what it **does NOT do** (what is delegated to another service);
+- **Contracts** — published APIs, published events, consumed events;
+- **Domain** — business concepts, referencing `glossary.md`.
+
+The "we do NOT do" section is one of the most valuable parts. It's what stops an agent from suggesting that service X should start doing something that belongs to service Y.
+
+### `glossary.md` — One Language
+
+A table of domain terms with a **precise and unique meaning**. The third column, "Not to be confused with", is the detail that adds the most value:
+
+| Term | Definition | Not to be confused with |
+|------|------------|-------------------------|
+| Price | Base amount charged for a product | Discount |
+| Reservation | Temporary hold on stock for an order | Shipment |
+| Eligibility | Conditions for a promotion to apply | Ranking |
+
+This pins down the ubiquitous language: code, specs, and conversations with the AI use **exactly** these terms. The glossary is loaded **always**, before any grep or code read — the wrong term leads to the wrong boundary decision.
+
+### `contracts/` — Source vs. Derived
+
+This is the most sophisticated architectural point, and the easiest to get wrong. The rule:
+
+> The **source of truth** for each contract lives in the service's own repo (`api/openapi.yaml`). This directory is **never edited by people**.
+
+The flow: a service changes its `openapi.yaml` → on merge to `main`, CI **publishes** it to the schema registry and **opens a PR in the context repo** updating `registry.yaml` and the `<slug>-v1.yaml` mirror. The mirror carries a `GENERATED — do not edit` header.
+
+| Artifact | Role | Hand-editable? |
+|----------|------|----------------|
+| `service/api/openapi.yaml` | source of truth | Yes (in the service repo) |
+| schema registry `<slug>-v1` | versioned distribution | No (CI) |
+| `contracts/registry.yaml` | version manifest | No (CI) |
+| `contracts/<slug>-v1.yaml` | readable mirror | **No** (CI) |
+
+**Why this matters for AI:** an agent that "fixes" the generated mirror is fixing a symptom, not the cause. Making the source explicit prevents edits that get overwritten on the next publish.
+
+## How Services Consume It
+
+The consumption model is the heart of the pattern: **remote reference — no submodule, no local copy**.
+
+### Raw URL, Not Submodule, Not Local Import
+
+The coupling between a service and the global context is a **raw URL** to the context repo on your git host — not a submodule, not a sibling-directory checkout:
+
+```
+Base: @https://git.example.com/platform/platform-context/-/raw/main/
+
+Always load:
+  - ecosystem/map.md                 # what exists in the ecosystem
+  - ecosystem/<this-service>.md      # this service's profile
+  - glossary.md                      # domain vocabulary
+
+Load on demand:
+  - standards/ (only the relevant guides)
+  - contracts/ (only the relevant contract)
+```
+
+What's happening here:
+
+1. The central repo is **versioned on `main`** as the source of truth;
+2. The `@` + raw URL pulls content straight into the agent's context, without syncing submodules across dozens of services;
+3. The scope split is explicit: the profile in `ecosystem/` describes **boundaries between services**; local `docs/` describe **internals**. **Don't duplicate — link.**
+
+### A Decision Tree — Load on Demand, Not Everything
+
+The service's `CLAUDE.md` / `AGENTS.md` doesn't list everything and load the world. It **classifies the scenario** and loads only the matching bundle:
+
+| Scenario | Examples | Loads | ~Tokens |
+|----------|----------|-------|---------|
+| 🟢 Quick question | "Where is file X?" | Nothing (answer from code) | 0 |
+| 🟡 Understand code | "How does the pipeline work?" | Relevant local doc | ~5K |
+| 🟠 Feature / change | "Add an endpoint" | Local architecture/pipeline docs | ~15K |
+| 🔴 Cross-service | "Integrate with service X" | 🟠 bundle + `map.md` → only the relevant flow | ~18K |
+| 🔵 On-call / bug | "Service is down" | Operations docs | ~10K |
+| 🟣 Code review | Review a PR | Conventions + language standards | ~3K |
+
+The rule for the agent is explicit: **use the decision tree. Don't load the full bundle for a quick question.**
+
+### Discovery by Index, Not by Guessing
+
+The agent locates things through the map and only then loads the relevant profile or flow. Search is a grep over domain synonyms (`grep -ri "<term>" ecosystem/`), confirmed against the index. After a few unsuccessful searches, **"I don't know" is the correct answer**: undocumented means it doesn't exist.
+
+### The Scope Contract
+
+- **`ecosystem/` profile** = what the service is as a whole (purpose, owner, dependencies, pub/sub contracts).
+- **The service's `docs/`** = pipeline, health matrix, feature flags, on-call.
+- **Standards** = come from the global `standards/`; a service only diverges if its own `docs/specs/conventions.md` justifies it.
+
+## Context Cost Is an Architecture Decision
+
+The repository is deliberately **cheap to load**. The central lesson: **context cost is an architecture decision, not an accident.**
+
+A typical session, with sizes measured on the repository I built:
+
+| Step | File | Size | ~Tokens |
+|------|------|------|---------|
+| 1. Glossary (always) | `glossary.md` | 2.3 KB / 370 words | ~0.6K |
+| 2. Map/index (always) | `ecosystem/map.md` | 7.5 KB / 785 words | ~1.9K |
+| 3. Service profile | `ecosystem/<slug>.md` | ~1.5 KB (avg) | ~0.4K |
+| 4. Relevant standards | 1 guide from `standards/` | 5–6.6 KB | ~1.5K |
+| **Typical total** | **4–6 files** | **~16 KB** | **~4–5K tokens** |
+
+The whole repo is **31 markdown files, ~64 KB, ~7,800 words** (roughly 10–16K tokens). Loading everything would burn ~3x the budget of a typical session before touching a single line of service code. That's why "what **NOT** to load" has to be written down: never the whole repo, never another initiative's documents, never history treated as current state.
+
+## Structural Validation — A Linter for Knowledge
+
+Documentation only survives if its structure stays intact. Without enforcement, multiple squads editing at the same time quickly break the links between files.
+
+A `validate.py` (or equivalent) running in CI as a **blocking gate** enforces **bidirectional** checks — an error blocks the PR:
+
+- **profile ↔ map** — every `ecosystem/<slug>.md` is listed in `map.md`, and every `map.md` entry has a profile;
+- **required fields** in every profile (owner, relationships, boundaries, contracts);
+- **contract ↔ registry** — every contract cited in a profile exists in `registry.yaml`;
+- **no broken links** and **well-formed Mermaid diagrams**;
+- **glossary** with no duplicate terms and a filled-in "not to be confused with" column.
+
+Warnings (broken external link, missing optional section) **don't** block. The effect is a **linter for knowledge**: nobody adds a service without registering it on the map, and nobody removes a topic without breaking the profiles that reference it.
+
+## The Rules That Make It Work
+
+It's not just the folder structure — it's the **maintenance rules** that keep the context alive and trustworthy.
+
+### Describe the Current State — Never Plans or History
+
+> This repository describes **the current state** of the ecosystem. No plans, no history.
+
+Plans and history go stale in days. The global context only answers "how is it today?". Intent documents live in the services — like `plan.md`, explicitly marked **FROZEN** after merge. An incident report or postmortem that mentions a service or topic missing from the index **does not prove** it exists today.
+
+### The Index Defines What Exists
+
+> Not in the index = does not exist in the ecosystem until documented.
+
+The agent checks `map.md` before claiming a service, topic, or contract exists. Document first, then use. This turns missing information into a **correct** answer ("I don't know") instead of an **invented** one.
+
+### Updating the Context Is Part of the Definition of Done
+
+A change that doesn't update the context **isn't done**. This is what keeps the repository from rotting — maintenance is coupled to the workflow, not a separate effort that gets pushed to "later". The golden rule: **a PR that changes a boundary updates the global context in the same PR.** A new service, dependency, or term is never a follow-up.
+
+### Every Boundary Change Updates the Map
+
+Boundaries between services — who calls whom, new topics, contracts — are the most valuable information on the map. Changed a boundary? Update the profile **and** the diagram in `map.md`.
+
+### Frozen Templates vs. Living Specs
+
+`templates/plan.md` is a **frozen artifact**: it captures *intent* at a point in time and is **not updated** after merge. What evolves is the living spec in the service's `docs/specs/`. Separating "historical intent" from "current state" avoids the classic confusion of an outdated document being treated as truth.
+
+### Contracts Are Source-Derived, Never Edited Copies
+
+As covered above: the truth lives in the service repo; the context repo only holds a generated mirror. That removes the worst kind of drift — two copies of the same contract that silently stop matching.
+
+## Optional: The Execution Edge — Skills and MCPs
+
+The repository can stop being passive text and start **installing tools**. That's the natural next step once the context gains *procedural* parts (PRD → TRD → ticket orchestration, review, commit, diagnostics). Two mechanisms:
+
+- **Skills**: one skill = one folder with a `SKILL.md` at the top and long references under `references/` (loaded on demand). Linked via **symlink** into `~/.claude/skills/`, so a `git pull` on the repo propagates changes with no reinstall.
+- **MCPs**: declared in a versioned `.mcp.json` (project scope) and registered by a `setup.sh`.
+
+A manifest (`skills/INDEX.md` or similar) is the canonical registry — a new skill only needs a folder plus a line in the manifest, and setup discovers it.
+
+My advice: add this layer **after** the index, validation, and on-demand loading are stable. Tools built on top of an unreliable map just automate the hallucinations.
+
+## Building Your Own, Step by Step
+
+1. **Inventory the ecosystem.** List every service and integration (HTTP and events). Start with the map: draw the main flows in Mermaid.
+2. **Create a lean `map.md`.** Diagrams, service index, topics. No details — it's just the index (and the anti-hallucination index).
+3. **Define the profile template** (`_template.md`). The critical fields: purpose, owner, upstream/downstream relationships, boundaries ("does" / "does not do"), contracts.
+4. **Fill in one profile per service.** Start with the core, most-connected services and radiate outward.
+5. **Write the glossary.** Collect domain terms and, for each one, note "not to be confused with". This step is cheap and pays off immediately.
+6. **Extract the standards.** Move the conventions currently repeated across services into `standards/`. Pointing to one place beats duplicating.
+7. **Automate contracts.** If you already use OpenAPI or a schema registry, have CI publish the generated mirror. If not, start with manual references and evolve.
+8. **Write the structural validation.** A script with the bidirectional checks (profile ↔ map, contract ↔ registry), running in CI as a blocking gate. This is what keeps the context intact when many squads edit it.
+9. **Connect the services.** In each service, add a minimal `CLAUDE.md` / `AGENTS.md` with the decision tree and raw URLs pointing to the central repo. Don't migrate everything at once — start with the glossary and the service profile.
+10. **Establish the rules.** "Current state only", "not in the index = doesn't exist", "context is part of the DoD", "a boundary change updates the map". Without them, the repository rots in weeks.
+
+## With vs. Without Global Context
+
+What changes when an AI agent works on a service **with** versus **without** global context. The context-cost numbers are measured; the engineering outcomes are directional and worth instrumenting on your own team.
+
+### Context Cost per Session (Measured)
+
+| | Without global context | With global context |
+|---|---|---|
+| Shared context files | 0 (only the service's code) | 4–6 (on demand) |
+| Shared context tokens | 0 useful — or ~10–16K if it ingests everything | ~4–5K |
+| Ecosystem visibility | none (doesn't know who calls whom) | `map.md` + service profile |
+| Sources of truth | N (one per service) | 1 (index + profiles + glossary) |
+| Anti-hallucination index | absent | `map.md` defines what exists |
+
+Without global context, the agent has two bad options: load **nothing** (and fill the gaps with fiction) or load **everything** (and spend ~3x a typical session's budget before touching the code). With global context, it loads ~4–5K tokens and hits the target.
+
+### Engineering Outcomes (Instrument These)
+
+| Outcome | Without global context | With global context |
+|---|---|---|
+| Services/topics invented by the agent | frequent (no index) | rare (index = anti-hallucination) |
+| Boundaries broken by a change | caught late, if at all | blocked by structural validation in CI |
+| Diverging copies of a contract | common | none (source-derived, never edited) |
+
+These are qualitative on purpose — I don't have telemetry to fill them in precisely. If you instrument onboarding time, hallucination rate in code review, and the number of PRs that break a contract, those are the fields worth measuring to close the picture.
+
+## Anti-Patterns and Pitfalls
+
+| Anti-pattern | Why it hurts | What to do instead |
+|--------------|--------------|--------------------|
+| **Ingesting the whole repo** | Kills the context budget before touching code | Navigate through the index, on demand |
+| **Copying content** instead of referencing | Copies drift; the agent reads a stale version | Link (raw URL), never paste |
+| **Submodules** | Sync friction, pinned versions | Raw URL to `main` |
+| **Detailing everything in `map.md`** | It grows huge and nobody maintains it | One profile per service; lean map |
+| **Treating history as current state** | Rots in days, becomes noise | Current state only; plans live in the service |
+| **Inventing a service/topic** | The agent hallucinates boundaries | Not in the index = doesn't exist |
+| **Hand-editing a contract mirror** | Overwritten by the next publish | Change the source in the service repo |
+| **Glossary without "not to be confused with"** | Terms stay ambiguous | Always fill the third column |
+| **Context outside the DoD** | The repository dies from neglect | Couple maintenance to the workflow |
+
+## Conclusion
+
+Global context solves a problem that grows with scale: **ecosystem knowledge has nowhere to live**. It stays trapped in people's heads — and for AI agents, it simply doesn't exist.
+
+The pattern works because it:
+
+- **centralizes** shared knowledge (ecosystem, standards, domain) in one place, **referenced instead of copied**;
+- **loads on demand** (decision tree + index), keeping context cost under control at ~4–5K tokens per typical session;
+- **protects integrity** with blocking structural validation in CI;
+- **prevents hallucination** with the "not in the index = doesn't exist" rule;
+- **separates stable from volatile** — lean map vs. profiles, living specs vs. frozen plans, source vs. generated mirror;
+- **couples maintenance to the workflow** through the Definition of Done, instead of relying on goodwill.
+
+The concrete payoff: an AI agent that opens any service on the team already arrives **knowing what a senior engineer on that team knows** — who calls whom, what each service is responsible for, which standards to follow, and which words describe the domain. The repository itself isn't the point. The point is the combination of **index + validation + on-demand loading + gates**.
