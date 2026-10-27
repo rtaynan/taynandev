@@ -49,8 +49,9 @@ platform-context/
 │   ├── system-design.md# decomposition, consistency, resilience
 │   └── style-guide.md  # language, API, logging, observability, git
 ├── contracts/          # GENERATED mirrors of published contracts
-│   ├── registry.yaml   # manifest (updated by CI)
-│   └── <slug>-v1.yaml  # readable mirror (DO NOT edit by hand)
+│   ├── registry.yaml   # manifest + lifecycle (updated by CI)
+│   ├── <slug>-v1.yaml  # readable mirror (DO NOT edit by hand)
+│   └── <slug>.changelog.md # append-only history: diff + why (CI)
 ├── templates/          # artifacts services copy
 │   ├── trd.md          # Technical Requirements Document
 │   ├── plan.md         # implementation plan (FROZEN after merge)
@@ -189,7 +190,8 @@ A `validate.py` (or equivalent) running in CI as a **blocking gate** enforces **
 - **required fields** in every profile (owner, relationships, boundaries, contracts);
 - **contract ↔ registry** — every contract cited in a profile exists in `registry.yaml`;
 - **no broken links** and **well-formed Mermaid diagrams**;
-- **glossary** with no duplicate terms and a filled-in "not to be confused with" column.
+- **glossary** with no duplicate terms and a filled-in "not to be confused with" column;
+- **contract evolution** — every published version has a changelog entry, every breaking change is a new major, and every deprecated version has a sunset date (details in [Contract Evolution](#contract-evolution-was-is-and-why) below).
 
 Warnings (broken external link, missing optional section) **don't** block. The effect is a **linter for knowledge**: nobody adds a service without registering it on the map, and nobody removes a topic without breaking the profiles that reference it.
 
@@ -225,6 +227,119 @@ Boundaries between services — who calls whom, new topics, contracts — are th
 
 As covered above: the truth lives in the service repo; the context repo only holds a generated mirror. That removes the worst kind of drift — two copies of the same contract that silently stop matching.
 
+## Contract Evolution: Was, Is, and Why
+
+The rules above answer "what does the contract look like today?". Sooner or later someone asks two other questions: *what did it look like before?* and *why did it change?* At first that seems to clash with "current state only". It doesn't, as long as history lives in its own artifact: labeled as history, generated, append-only, and loaded only on demand. Same reasoning as the frozen `plan.md`.
+
+Each question has a different owner:
+
+| Question | Answered by | Automatable? |
+|----------|-------------|--------------|
+| **How is it?** | the current mirror (`<slug>-v2.yaml`) | Yes — CI already generates it |
+| **How was it?** | previous versions in the registry + a semantic diff | Yes — CI computes it |
+| **Why did it change?** | a person, at the moment of the change | **No** — it has to be required at the source |
+
+The "why" is the part most teams lose. Git records *what* changed, but almost never *why*, at least not anywhere you can find later. So the reason has to be **mandatory in the service's PR**, exactly like the contract itself.
+
+To make it concrete, I'll follow one change end to end: the `orders` service publishes an `order.created` event, and the payload gains a field `fraud_screened` to indicate that the order went through the `fraud-check` service.
+
+### 1. The Reason Is Born at the Source
+
+In the service repo, the same PR changes the contract and records the reason:
+
+```yaml
+# orders/api/openapi.yaml
+OrderCreated:
+  properties:
+    order_id: { type: string }
+    total:    { type: integer }
+    fraud_screened:                # new
+      type: boolean
+      description: >
+        True when the order was processed by fraud-check.
+        Absent on orders created before v2.4.0.
+```
+
+```markdown
+<!-- orders/api/CHANGELOG.md -->
+## v2.4.0
+**Why:** consumers (invoicing, analytics) need to know when fraud-check
+took part in the order, to attribute cost and filter reports. Until now
+they inferred it by calling fraud-check directly. See ADR-042.
+**Consumer action:** none required. Optional field; absent = false.
+```
+
+CI blocks the merge if `openapi.yaml` changed without a changelog entry. That's the only way the "why" reliably exists later.
+
+### 2. CI Computes "Was → Is"
+
+On merge, CI runs a **semantic** diff, not a text diff — `oasdiff` for OpenAPI, `buf breaking` for Protobuf, or the schema registry's compatibility check for Avro/JSON Schema:
+
+```
+order.created  v2.3.0 → v2.4.0   NON-BREAKING
+  + added optional property: fraud_screened (boolean)
+```
+
+The field is optional, so this is a minor version inside `v2`. If it were **required**, the diff would classify it as breaking, CI would demand a new major (`v3`), and `v2` would be marked deprecated with a sunset date. Nobody writes the diff by hand, so it can't drift.
+
+### 3. The Context Repo Gets a Generated, Append-Only Changelog
+
+The PR that CI opens in the context repo now carries three things: the regenerated mirror, a new entry at the top of `contracts/orders.changelog.md`, and the updated registry.
+
+```markdown
+## v2.4.0 — 2026-10-27 · non-breaking · orders PR #517
+**Diff (generated):** + optional `fraud_screened` (boolean) on `order.created`
+**Why (from source):** consumers need to know when fraud-check took part
+in the order, for cost attribution and reporting. See ADR-042.
+**Consumers affected:** none required (additive; absent = false)
+```
+
+The registry stores the **lifecycle**, not just the latest version:
+
+```yaml
+orders:
+  - version: v2
+    status: current
+    latest: 2.4.0
+  - version: v1
+    status: deprecated
+    deprecated_on: 2026-06-01
+    sunset_on: 2026-12-01
+    replaced_by: v2
+    consumers: [checkout, invoicing]   # cross-checked against map.md
+```
+
+Breaking changes always produce a new major, both majors coexist until `sunset_on`, and the consumer list shows who still has to migrate.
+
+### 4. The Part CI Can't See: Did a Boundary Change?
+
+`fraud_screened` says that `fraud-check` is now part of the order flow. That's a boundary change, so the rule from earlier applies — the same PR updates the map:
+
+- **`ecosystem/orders.md`** — `fraud-check` goes under *downstream*, if `orders` now calls it;
+- **`ecosystem/map.md`** — the checkout diagram gains the `orders → fraud-check` edge;
+- **`glossary.md`** — if "fraud screening" is a business concept with its own name, it gets an entry and a "not to be confused with".
+
+To avoid relying on memory, `validate.py` can cross-check: a contract that references a service missing from the profile's relationships raises a warning.
+
+### 5. What the Agent Answers Afterwards
+
+| Question | Where the agent looks | Answer |
+|----------|-----------------------|--------|
+| "Which fields does `order.created` have?" | `orders-v2.yaml` (default) | includes `fraud_screened` |
+| "Since when does `fraud_screened` exist?" | `orders.changelog.md` (on demand) | v2.4.0, 2026-10-27, PR #517 |
+| "Why was it added?" | changelog → ADR-042 | cost attribution and reporting |
+| "Can I trust it on old orders?" | field `description` + changelog | No — absent before v2.4.0 means `false` |
+| "Who calls `fraud-check`?" | `map.md` + profiles | `orders` (only if step 4 was done) |
+
+The last row is why step 4 matters. Without it, the contract knows `fraud-check` is in the flow but the map doesn't — and under "not in the index = doesn't exist", the agent answers wrong.
+
+### The Rules, Summarized
+
+- **Default to `current`.** The changelog is never part of the default load; it's loaded only for "why", "since when", or "what breaks if I migrate".
+- **A deprecated version is never current state** — the same rule as "history isn't current state".
+- **No documented reason, no invented reason.** If the changelog doesn't explain a change, "it isn't documented" is the correct answer. The agent doesn't guess a justification from the diff.
+- **Validation covers evolution too:** every registry version has a changelog entry, every breaking change is a new major, every deprecated version has `sunset_on`, `replaced_by` and consumers, and a profile citing a sunset version fails the build.
+
 ## Optional: The Execution Edge — Skills and MCPs
 
 The repository can stop being passive text and start **installing tools**. That's the natural next step once the context gains *procedural* parts (PRD → TRD → ticket orchestration, review, commit, diagnostics). Two mechanisms:
@@ -244,7 +359,7 @@ My advice: add this layer **after** the index, validation, and on-demand loading
 4. **Fill in one profile per service.** Start with the core, most-connected services and radiate outward.
 5. **Write the glossary.** Collect domain terms and, for each one, note "not to be confused with". This step is cheap and pays off immediately.
 6. **Extract the standards.** Move the conventions currently repeated across services into `standards/`. Pointing to one place beats duplicating.
-7. **Automate contracts.** If you already use OpenAPI or a schema registry, have CI publish the generated mirror. If not, start with manual references and evolve.
+7. **Automate contracts.** If you already use OpenAPI or a schema registry, have CI publish the generated mirror. If not, start with manual references and evolve. Once publishing works, add the semantic diff and require a changelog entry ("why") on every contract change.
 8. **Write the structural validation.** A script with the bidirectional checks (profile ↔ map, contract ↔ registry), running in CI as a blocking gate. This is what keeps the context intact when many squads edit it.
 9. **Connect the services.** In each service, add a minimal `CLAUDE.md` / `AGENTS.md` with the decision tree and raw URLs pointing to the central repo. Don't migrate everything at once — start with the glossary and the service profile.
 10. **Establish the rules.** "Current state only", "not in the index = doesn't exist", "context is part of the DoD", "a boundary change updates the map". Without them, the repository rots in weeks.
@@ -286,6 +401,8 @@ These are qualitative on purpose — I don't have telemetry to fill them in prec
 | **Treating history as current state** | Rots in days, becomes noise | Current state only; plans live in the service |
 | **Inventing a service/topic** | The agent hallucinates boundaries | Not in the index = doesn't exist |
 | **Hand-editing a contract mirror** | Overwritten by the next publish | Change the source in the service repo |
+| **Contract change without a "why"** | Six months later nobody knows the reason, and the agent invents one | Require a changelog entry in the service PR; CI blocks without it |
+| **Breaking change shipped as a minor** | Consumers break silently | Semantic diff in CI; breaking = new major with a sunset date |
 | **Glossary without "not to be confused with"** | Terms stay ambiguous | Always fill the third column |
 | **Context outside the DoD** | The repository dies from neglect | Couple maintenance to the workflow |
 
@@ -303,3 +420,11 @@ The pattern works because it:
 - **couples maintenance to the workflow** through the Definition of Done, instead of relying on goodwill.
 
 The concrete payoff: an AI agent that opens any service on the team already arrives **knowing what a senior engineer on that team knows** — who calls whom, what each service is responsible for, which standards to follow, and which words describe the domain. The repository itself isn't the point. The point is the combination of **index + validation + on-demand loading + gates**.
+
+## Why This Matters Beyond One Company
+
+AI coding agents are quickly becoming a standard part of how software gets written, and the bottleneck is shifting from model capability to context. An agent that sees one repository in a microservices ecosystem will invent the rest: endpoints that don't exist, event names that are almost right, conventions that belong to some other codebase. Any organization running more than a handful of services hits this problem, whatever model or tool it uses.
+
+Fragmented knowledge didn't start with AI. New engineers onboarding, teams handing off services, and incident responders tracing calls across boundaries all pay the same tax. Agents make it more visible, and more expensive, because they act on missing context immediately and with confidence. A wrong guess from an agent ships faster than a wrong guess from a person.
+
+The pattern described here doesn't depend on any particular vendor or tool: one validated source of truth, an index loaded on demand, and maintenance tied to the Definition of Done. It's meant to be copied. If it saves another team from rediscovering, service by service, that their agents need a map before they can be trusted with the territory, the effort of writing it up has paid off.
